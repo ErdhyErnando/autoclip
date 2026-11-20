@@ -15,7 +15,8 @@ from ..db import store
 from ..db.models import Export, new_id
 from ..pipeline import captions as captions_module
 from ..pipeline import export as export_module
-from ..pipeline.reframe.croppath import CropPath, centre_crop
+from ..pipeline.reframe.croppath import CropPath, centre_crop, shift_crop_path
+from ..pipeline.reframe.facecam import FacecamBox, search_facecam
 from ..pipeline.runner import JobWorkspace
 from ..pipeline.transcript import Transcript, Word
 from .schemas import (
@@ -25,6 +26,7 @@ from .schemas import (
     ClipPatchIn,
     ExportOut,
     ExportRequestIn,
+    FacecamOut,
     WordOut,
 )
 
@@ -97,6 +99,57 @@ async def clip_crop_path(clip_id: str) -> dict:
     return (await asyncio.to_thread(CropPath.load, cached)).to_dict()
 
 
+@router.get("/clips/{clip_id}/facecam", response_model=FacecamOut)
+async def get_facecam(clip_id: str) -> FacecamOut:
+    """The cached facecam box for a clip, if detection has run."""
+    clip = await asyncio.to_thread(store.get_clip, clip_id)
+    if clip is None:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+
+    cached = JobWorkspace(clip.job_id).facecam(clip.id)
+    if not cached.exists():
+        raise HTTPException(
+            status_code=404, detail="No facecam detected yet — run detection first."
+        )
+
+    return FacecamOut(**(await asyncio.to_thread(FacecamBox.load, cached)).to_dict())
+
+
+@router.post("/clips/{clip_id}/facecam/detect", response_model=FacecamOut)
+async def detect_facecam(clip_id: str) -> FacecamOut:
+    """Search a clip's range for a persistent corner face and cache the box.
+
+    Full-frame pass first, then close-up corner passes. Takes on the order of
+    a minute of CPU per minute of clip; the result is cached per clip.
+    """
+    clip = await asyncio.to_thread(store.get_clip, clip_id)
+    if clip is None:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+
+    job = await asyncio.to_thread(store.get_job, clip.job_id)
+    source = await asyncio.to_thread(store.get_source, job.source_id) if job else None
+    if job is None or source is None:
+        raise HTTPException(status_code=404, detail="The clip's source is missing.")
+
+    box = await asyncio.to_thread(
+        search_facecam,
+        Path(source.path),
+        source.width or 1920,
+        source.height or 1080,
+        start_s=clip.start_s,
+        end_s=clip.end_s,
+    )
+    if box is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No persistent corner face found in this clip's range.",
+        )
+
+    workspace = JobWorkspace(clip.job_id)
+    await asyncio.to_thread(box.save, workspace.facecam(clip.id))
+    return FacecamOut(**box.to_dict())
+
+
 @router.patch("/clips/{clip_id}", response_model=ClipOut)
 async def patch_clip(clip_id: str, payload: ClipPatchIn) -> ClipOut:
     """Trim, retitle, or keep/discard a clip.
@@ -162,6 +215,27 @@ async def patch_captions(clip_id: str, payload: CaptionPatchIn) -> ClipOut:
         ),
         caption_style=payload.caption_style or (existing.caption_style if existing else "bold_pop"),
         ratio=payload.ratio or (existing.ratio if existing else "9:16"),
+        crop_nudge=(
+            payload.crop_nudge
+            if payload.crop_nudge is not None
+            else (existing.crop_nudge if existing else 0.0)
+        ),
+        centre_crop=(
+            payload.centre_crop
+            if payload.centre_crop is not None
+            else (existing.centre_crop if existing else False)
+        ),
+        pip_enabled=(
+            payload.pip_enabled
+            if payload.pip_enabled is not None
+            else (existing.pip_enabled if existing else False)
+        ),
+        pip_corner=payload.pip_corner or (existing.pip_corner if existing else "auto"),
+        pip_size=(
+            payload.pip_size
+            if payload.pip_size is not None
+            else (existing.pip_size if existing else 0.35)
+        ),
     )
     await asyncio.to_thread(store.upsert_clip_edit, edit)
 
@@ -196,6 +270,34 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
     workspace = JobWorkspace(clip.job_id)
     crop_path = await asyncio.to_thread(_crop_path_for, workspace, clip, source, payload.ratio)
 
+    # Framing corrections: an explicit centre lock wins, otherwise the stored or
+    # requested nudge shifts the tracked window. Both re-derive from the cached
+    # path, so the correction never touches the stored reframe data.
+    stored_edit = await asyncio.to_thread(store.get_clip_edit, clip_id)
+    nudge = (
+        payload.crop_nudge
+        if payload.crop_nudge is not None
+        else (stored_edit.crop_nudge if stored_edit else 0.0)
+    )
+    locked = (
+        payload.centre_crop
+        if payload.centre_crop is not None
+        else (stored_edit.centre_crop if stored_edit else False)
+    )
+    if locked:
+        aspect = {"9:16": (9, 16), "1:1": (1, 1), "16:9": (16, 9)}[payload.ratio]
+        crop_path = centre_crop(
+            source.width or 1920,
+            source.height or 1080,
+            clip.end_s - clip.start_s,
+            aspect_w=aspect[0],
+            aspect_h=aspect[1],
+        )
+    elif nudge:
+        crop_path = shift_crop_path(crop_path, nudge)
+
+    pip = _pip_for_export(workspace, clip, source, payload, stored_edit, payload.ratio)
+
     destination = (
         paths.exports_dir()
         / clip.job_id
@@ -211,6 +313,7 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
         words=words,
         style=style,
         ratio=payload.ratio,
+        pip=pip,
     )
 
     try:
@@ -316,6 +419,48 @@ def _load_transcript(job_id: str) -> Transcript:
     if not workspace.transcript.exists():
         raise HTTPException(status_code=404, detail="This job has no transcript yet.")
     return Transcript.load(workspace.transcript)
+
+
+def _pip_for_export(workspace, clip, source, payload, stored_edit, ratio: str):
+    """Resolve the PiP layout for an export, or None for a normal render.
+
+    Payload values win when set; otherwise the clip's stored corrections apply.
+    "auto" corner follows the detected facecam box.
+    """
+    enabled = (
+        payload.pip_enabled
+        if payload.pip_enabled is not None
+        else (stored_edit.pip_enabled if stored_edit else False)
+    )
+    if not enabled:
+        return None
+
+    cached = workspace.facecam(clip.id)
+    if not cached.exists():
+        raise HTTPException(
+            status_code=400,
+            detail="Picture-in-picture is on but no facecam was detected — run detection first.",
+        )
+    box = FacecamBox.load(cached)
+
+    corner = (
+        payload.pip_corner
+        if payload.pip_corner is not None
+        else (stored_edit.pip_corner if stored_edit else "auto")
+    )
+    size = (
+        payload.pip_size
+        if payload.pip_size is not None
+        else (stored_edit.pip_size if stored_edit else 0.35)
+    )
+    return export_module.PipLayout(
+        x=box.x,
+        y=box.y,
+        width=box.width,
+        height=box.height,
+        corner=corner if corner != "auto" else box.corner,
+        size_ratio=min(0.6, max(0.2, size)),
+    )
 
 
 def _crop_path_for(workspace: JobWorkspace, clip, source, ratio: str) -> CropPath:

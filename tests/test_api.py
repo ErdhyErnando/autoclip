@@ -310,6 +310,42 @@ class TestClips:
         assert response.status_code == 200
         assert response.json()["caption_style"] == "karaoke_fill"
 
+    def test_framing_corrections_are_persisted(
+        self, client: TestClient, job_with_clips: Job
+    ) -> None:
+        clip_id = client.get(f"/api/jobs/{job_with_clips.id}/clips").json()[0]["id"]
+
+        response = client.patch(
+            f"/api/clips/{clip_id}/captions",
+            json={
+                "crop_nudge": 0.5,
+                "centre_crop": True,
+                "pip_enabled": True,
+                "pip_corner": "bl",
+                "pip_size": 0.4,
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["crop_nudge"] == pytest.approx(0.5)
+        assert body["centre_crop"] is True
+        assert body["pip_enabled"] is True
+        assert body["pip_corner"] == "bl"
+        assert body["pip_size"] == pytest.approx(0.4)
+
+    def test_out_of_range_nudge_is_rejected(self, client: TestClient, job_with_clips: Job) -> None:
+        clip_id = client.get(f"/api/jobs/{job_with_clips.id}/clips").json()[0]["id"]
+
+        response = client.patch(f"/api/clips/{clip_id}/captions", json={"crop_nudge": 2.0})
+
+        assert response.status_code == 422
+
+    def test_facecam_is_404_before_detection(self, client: TestClient, job_with_clips: Job) -> None:
+        clip_id = client.get(f"/api/jobs/{job_with_clips.id}/clips").json()[0]["id"]
+
+        assert client.get(f"/api/clips/{clip_id}/facecam").status_code == 404
+
     def test_unknown_caption_style_is_rejected(
         self, client: TestClient, job_with_clips: Job
     ) -> None:

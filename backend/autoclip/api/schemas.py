@@ -153,6 +153,11 @@ class ClipOut(BaseModel):
     user_trimmed: bool
     caption_style: str = "bold_pop"
     ratio: str = "9:16"
+    crop_nudge: float = 0.0
+    centre_crop: bool = False
+    pip_enabled: bool = False
+    pip_corner: str = "auto"
+    pip_size: float = 0.35
     exports: list[ExportOut] = Field(default_factory=list)
 
     @classmethod
@@ -180,6 +185,11 @@ class ClipOut(BaseModel):
             user_trimmed=clip.user_trimmed,
             caption_style=edit.caption_style if edit else "bold_pop",
             ratio=edit.ratio if edit else "9:16",
+            crop_nudge=edit.crop_nudge if edit else 0.0,
+            centre_crop=edit.centre_crop if edit else False,
+            pip_enabled=edit.pip_enabled if edit else False,
+            pip_corner=edit.pip_corner if edit else "auto",
+            pip_size=edit.pip_size if edit else 0.35,
             exports=[ExportOut.of(e) for e in (exports or [])],
         )
 
@@ -197,12 +207,33 @@ class CaptionPatchIn(BaseModel):
     words: list[WordOut] | None = None
     caption_style: str | None = None
     ratio: Literal["9:16", "1:1", "16:9"] | None = None
+    #: -1 (full left) to +1 (full right); None leaves the stored value alone.
+    crop_nudge: float | None = Field(default=None, ge=-1.0, le=1.0)
+    centre_crop: bool | None = None
+    pip_enabled: bool | None = None
+    pip_corner: Literal["auto", "tl", "tr", "bl", "br"] | None = None
+    pip_size: float | None = Field(default=None, ge=0.2, le=0.6)
 
 
 class ExportRequestIn(BaseModel):
     ratio: Literal["9:16", "1:1", "16:9"] = "9:16"
     style: str = "bold_pop"
     write_srt: bool = False
+    #: Overrides the clip's stored nudge when set; otherwise the stored value wins.
+    crop_nudge: float | None = Field(default=None, ge=-1.0, le=1.0)
+    centre_crop: bool | None = None
+    pip_enabled: bool | None = None
+    pip_corner: Literal["auto", "tl", "tr", "bl", "br"] | None = None
+    pip_size: float | None = Field(default=None, ge=0.2, le=0.6)
+
+
+class FacecamOut(BaseModel):
+    x: float
+    y: float
+    width: float
+    height: float
+    corner: str
+    coverage: float
 
 
 class CaptionStyleOut(BaseModel):
