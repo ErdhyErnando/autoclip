@@ -701,5 +701,116 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes}:{secs:02d}"
 
 
+# --------------------------------------------------------------------------
+# Golden set
+# --------------------------------------------------------------------------
+
+goldens_app = typer.Typer(
+    help="Golden-set helpers for the reframe acceptance bar. See docs/goldens.md.",
+    no_args_is_help=True,
+)
+app.add_typer(goldens_app, name="goldens")
+
+
+@goldens_app.command("acquire")
+def goldens_acquire(
+    url: str = typer.Argument(..., help="Where to download the golden from."),
+    scenario: str = typer.Option(
+        ...,
+        help="One of: solo-speaker, multi-speaker, facecam-stream-vod, screen-content.",
+    ),
+    dest: Path = typer.Option(
+        ...,
+        "--dest",
+        help="Golden media directory. Media stays outside the repo; manifest.json lives here.",
+    ),
+    name: str | None = typer.Option(
+        None, help="Filename stem; defaults to the scenario key (use when a scenario has several)."
+    ),
+    format_selector: str | None = typer.Option(
+        None, "--format", help="yt-dlp format selector; defaults to the pinned ingest selector."
+    ),
+    cookies_from_browser: str | None = typer.Option(
+        None, help="Browser to read cookies from, for age-gated videos."
+    ),
+) -> None:
+    """Download a fixed golden once, hash it, and record its provenance."""
+    from rich.progress import BarColumn, Progress, TextColumn
+
+    from . import goldens as goldens_module
+
+    try:
+        with Progress(
+            TextColumn("Downloading..."),
+            BarColumn(),
+            TextColumn("{task.percentage:>3.0f}%"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("download", total=100.0)
+            golden = goldens_module.acquire(
+                url,
+                scenario,
+                dest,
+                name=name,
+                format_selector=format_selector,
+                cookies_from_browser=cookies_from_browser,
+                on_progress=lambda fraction: progress.update(task, completed=fraction * 100.0),
+            )
+    except goldens_module.GoldenSetError as exc:
+        console.print(f"{FAIL} {exc}")
+        raise typer.Exit(1) from exc
+
+    console.print(
+        f"{OK} {golden.file} pinned ({golden.sha256[:12]}...), scenario {golden.scenario}."
+    )
+    console.print(f"Manifest: {dest / goldens_module.MANIFEST_NAME}")
+    console.print(
+        "Next: acquire the other scenarios, then run "
+        "[cyan]AUTOCLIP_GOLDEN_MEDIA=<dir> pytest -m golden[/cyan]."
+    )
+
+
+@goldens_app.command("list")
+def goldens_list(
+    dest: Path = typer.Option(..., "--dest", help="Golden media directory holding manifest.json."),
+    verify: bool = typer.Option(
+        False, "--verify", help="Re-hash every file to confirm the pins still hold."
+    ),
+) -> None:
+    """Show the golden set, optionally confirming the pins still hold."""
+    from . import goldens as goldens_module
+
+    try:
+        entries = goldens_module.load_manifest(dest, verify_hashes=verify)
+    except goldens_module.GoldenSetError as exc:
+        console.print(f"{FAIL} {exc}")
+        raise typer.Exit(1) from exc
+
+    table = Table(title=f"Golden set — {dest}", header_style="bold", title_justify="left")
+    table.add_column("Scenario", width=18)
+    table.add_column("File")
+    table.add_column("SHA-256", width=14)
+    table.add_column("Acquired", width=12)
+    table.add_column("Source")
+
+    for golden in entries:
+        table.add_row(
+            golden.scenario,
+            golden.file,
+            f"{golden.sha256[:12]}...",
+            golden.acquired_date or "-",
+            golden.source_url or "-",
+        )
+    console.print(table)
+
+    if verify:
+        console.print(f"{OK} {len(entries)} goldens, every pin re-hashed and matching.")
+    console.print(
+        "Run the acceptance pass with "
+        "[cyan]AUTOCLIP_GOLDEN_MEDIA=<dir> pytest -m golden[/cyan], then walk "
+        "docs/goldens.md with your own eyes."
+    )
+
+
 if __name__ == "__main__":  # pragma: no cover
     app()
