@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-import { formatTimecode, type CaptionStyle, type CropPath, type Word } from '../api'
+import { formatTimecode, type CaptionStyle, type CropPath, type FacecamBox, type Word } from '../api'
 
 const VOLUME_KEY = 'autoclip.volume'
 
@@ -35,6 +35,11 @@ export function ClipPlayer({
   style,
   ratio,
   cropPath,
+  cropNudge = 0,
+  centreCrop = false,
+  captionSizeScale = 1,
+  onCaptionGeometry,
+  pip,
 }: {
   src: string
   startS: number
@@ -43,8 +48,16 @@ export function ClipPlayer({
   style: CaptionStyle | undefined
   ratio: string
   cropPath?: CropPath | null
+  cropNudge?: number
+  centreCrop?: boolean
+  captionSizeScale?: number
+  onCaptionGeometry?: (patch: { sizeScale?: number; positionRatio?: number | null }) => void
+  /** Facecam inset preview; null renders the normal tracked crop. */
+  pip?: { box: FacecamBox; corner: string; size: number } | null
 }) {
   const video = useRef<HTMLVideoElement>(null)
+  const pipBg = useRef<HTMLVideoElement>(null)
+  const pipInset = useRef<HTMLVideoElement>(null)
   const [playing, setPlaying] = useState(false)
   const [time, setTime] = useState(startS)
   const [volume, setVolume] = useState(readStoredVolume)
@@ -84,9 +97,13 @@ export function ClipPlayer({
     const element = video.current
     if (!element) return
     element.currentTime = startS
+    if (pipBg.current) pipBg.current.currentTime = startS
+    if (pipInset.current) pipInset.current.currentTime = startS
     setTime(startS)
     setPlaying(false)
     element.pause()
+    pipBg.current?.pause()
+    pipInset.current?.pause()
   }, [src, startS])
 
   const onTimeUpdate = useCallback(() => {
@@ -95,6 +112,12 @@ export function ClipPlayer({
     if (element.currentTime >= endS) {
       element.pause()
       element.currentTime = startS
+      for (const other of [pipBg.current, pipInset.current]) {
+        if (other) {
+          other.pause()
+          other.currentTime = startS
+        }
+      }
       setPlaying(false)
       setTime(startS)
       return
@@ -108,11 +131,17 @@ export function ClipPlayer({
     if (element.paused) {
       if (element.currentTime < startS || element.currentTime >= endS) {
         element.currentTime = startS
+        if (pipBg.current) pipBg.current.currentTime = startS
+        if (pipInset.current) pipInset.current.currentTime = startS
       }
       void element.play()
+      void pipBg.current?.play()
+      void pipInset.current?.play()
       setPlaying(true)
     } else {
       element.pause()
+      pipBg.current?.pause()
+      pipInset.current?.pause()
       setPlaying(false)
     }
   }
@@ -120,7 +149,7 @@ export function ClipPlayer({
   const elapsed = Math.max(0, time - startS)
   const duration = Math.max(0.01, endS - startS)
 
-  const cropStyle = cropWindowStyle(cropPath, elapsed)
+  const cropStyle = cropWindowStyle(cropPath, elapsed, cropNudge, centreCrop)
   const [aspectW, aspectH] = ASPECTS[ratio] ?? ASPECTS['9:16']
   // Height alone can't bound the box: with width:100% and an aspect-ratio, a
   // max-height clamp shortens the element without narrowing it, so the rendered
@@ -144,18 +173,38 @@ export function ClipPlayer({
           }
         }}
       >
-        <video
-          ref={video}
-          src={src}
-          className={cropStyle ? 'absolute max-w-none' : 'size-full object-cover'}
-          style={cropStyle ?? undefined}
-          onTimeUpdate={onTimeUpdate}
-          preload="auto"
-          playsInline
-          controls={nativeControls}
-        />
+        {pip && cropPath ? (
+          <PipLayers
+            src={src}
+            mainRef={video}
+            bgRef={pipBg}
+            insetRef={pipInset}
+            onTimeUpdate={onTimeUpdate}
+            nativeControls={nativeControls}
+            pip={pip}
+            sourceW={cropPath.source_width}
+            sourceH={cropPath.source_height}
+          />
+        ) : (
+          <video
+            ref={video}
+            src={src}
+            className={cropStyle ? 'absolute max-w-none' : 'size-full object-cover'}
+            style={cropStyle ?? undefined}
+            onTimeUpdate={onTimeUpdate}
+            preload="auto"
+            playsInline
+            controls={nativeControls}
+          />
+        )}
 
-        <CaptionOverlay words={words} time={time} style={style} />
+        <CaptionOverlay
+          words={words}
+          time={time}
+          style={style}
+          sizeScale={captionSizeScale}
+          onGeometry={onCaptionGeometry}
+        />
 
         {!playing && (
           <div className="pointer-events-none absolute inset-0 grid place-items-center">
@@ -314,10 +363,15 @@ async function measureOutputLevel(element: HTMLVideoElement): Promise<AudioCheck
  * independent of how large the preview happens to be drawn. Returns null when
  * there is no crop path — the caller then falls back to a centre crop, which is
  * what the renderer does in that case too.
+ *
+ * The nudge/lock math mirrors shift_crop_path and the centre lock on the
+ * server, so the preview and the export agree.
  */
 function cropWindowStyle(
   cropPath: CropPath | null | undefined,
   elapsed: number,
+  nudge = 0,
+  centre = false,
 ): React.CSSProperties | null {
   if (!cropPath || cropPath.segments.length === 0) return null
 
@@ -329,8 +383,19 @@ function cropWindowStyle(
   // Letting it fall through to object-contain is closer than any crop would be.
   if (segment.fit) return null
 
-  const { x, y } = interpolate(segment.keyframes, elapsed)
   const { source_width: sourceW, source_height: sourceH } = cropPath
+
+  let x: number
+  let y: number
+  if (centre) {
+    x = (sourceW - segment.width) / 2
+    y = (sourceH - segment.height) / 2
+  } else {
+    const interpolated = interpolate(segment.keyframes, elapsed)
+    const travel = sourceW - segment.width
+    x = travel > 0 ? Math.min(travel, Math.max(0, interpolated.x + nudge * travel)) : interpolated.x
+    y = interpolated.y
+  }
 
   return {
     width: `${(sourceW / segment.width) * 100}%`,
@@ -340,8 +405,107 @@ function cropWindowStyle(
   }
 }
 
-/** Piecewise-linear lookup, matching croppath.axis_expression on the server. */
-function interpolate(
+/**
+ * Picture-in-picture preview: full-frame screen over a blurred fill, with the
+ * facecam box as an inset — mirroring the export's PiP filtergraph.
+ *
+ * Three elements share one source; only the main one carries time updates and
+ * audio. Sync drift between them is irrelevant at review fidelity.
+ */
+function PipLayers({
+  src,
+  mainRef,
+  bgRef,
+  insetRef,
+  onTimeUpdate,
+  nativeControls,
+  pip,
+  sourceW,
+  sourceH,
+}: {
+  src: string
+  mainRef: React.MutableRefObject<HTMLVideoElement | null>
+  bgRef: React.MutableRefObject<HTMLVideoElement | null>
+  insetRef: React.MutableRefObject<HTMLVideoElement | null>
+  onTimeUpdate: () => void
+  nativeControls: boolean
+  pip: { box: FacecamBox; corner: string; size: number }
+  sourceW: number
+  sourceH: number
+}) {
+  const { box } = pip
+  // Reuse the crop math with a single static segment: the inset shows exactly
+  // the detected facecam box, like the export's crop filter does.
+  const insetStyle = cropWindowStyle(
+    {
+      source_width: sourceW,
+      source_height: sourceH,
+      segments: [
+        {
+          start_s: 0,
+          end_s: 1e9,
+          width: Math.round(box.width),
+          height: Math.round(box.height),
+          keyframes: [{ t: 0, x: box.x, y: box.y }],
+          strategy: 'general',
+          zoom: 0,
+          fit: false,
+        },
+      ],
+    },
+    0,
+  )
+  const margin = '2.2%'
+  const corner: Record<string, React.CSSProperties> = {
+    tl: { top: margin, left: margin },
+    tr: { top: margin, right: margin },
+    bl: { bottom: margin, left: margin },
+    br: { bottom: margin, right: margin },
+  }
+
+  return (
+    <>
+      <video
+        ref={bgRef}
+        src={src}
+        muted
+        preload="auto"
+        playsInline
+        className="absolute inset-0 size-full object-cover"
+        style={{ filter: 'blur(24px) brightness(0.7)', transform: 'scale(1.1)' }}
+      />
+      <video
+        ref={mainRef}
+        src={src}
+        preload="auto"
+        playsInline
+        controls={nativeControls}
+        onTimeUpdate={onTimeUpdate}
+        className="absolute inset-0 size-full object-contain"
+      />
+      <div
+        className="absolute overflow-hidden rounded-md ring-1 ring-white/30"
+        style={{
+          width: `${pip.size * 100}%`,
+          aspectRatio: `${box.width} / ${box.height}`,
+          ...(corner[pip.corner] ?? corner.tr),
+        }}
+      >
+        <video
+          ref={insetRef}
+          src={src}
+          muted
+          preload="auto"
+          playsInline
+          className="absolute max-w-none"
+          style={insetStyle ?? undefined}
+        />
+      </div>
+    </>
+  )
+}
+
+/** Piecewise-linear lookup, matching croppath.axis_expression on the server. */function interpolate(
   keyframes: { t: number; x: number; y: number }[],
   t: number,
 ): { x: number; y: number } {
@@ -454,11 +618,22 @@ function CaptionOverlay({
   words,
   time,
   style,
+  sizeScale,
+  onGeometry,
 }: {
   words: Word[]
   time: number
   style: CaptionStyle | undefined
+  sizeScale: number
+  onGeometry?: (patch: { sizeScale?: number; positionRatio?: number | null }) => void
 }) {
+  const boxRef = useRef<HTMLDivElement>(null)
+  const movedRef = useRef(false)
+  const [move, setMove] = useState<{ startY: number; startMargin: number } | null>(null)
+  const [dyPct, setDyPct] = useState(0)
+  const [resizing, setResizing] = useState<{ startY: number } | null>(null)
+  const [scaleFactor, setScaleFactor] = useState(1)
+
   if (!style || words.length === 0) return null
 
   const groups = groupWords(words, style.preview.maxWords)
@@ -466,14 +641,88 @@ function CaptionOverlay({
   if (!active) return null
 
   const { primary, accent, allCaps, outlineWidth, boxed, marginRatio, sizeRatio } = style.preview
+  const margin = move ? move.startMargin - dyPct : marginRatio * 100
+
+  const boxHeight = () => boxRef.current?.parentElement?.getBoundingClientRect().height ?? 1
+
+  const beginMove = (clientY: number) => {
+    if (!onGeometry) return
+    movedRef.current = false
+    setDyPct(0)
+    setMove({ startY: clientY, startMargin: marginRatio * 100 })
+  }
+
+  const trackMove = (clientY: number) => {
+    if (!move) return
+    const pct = ((clientY - move.startY) / boxHeight()) * 100
+    if (Math.abs(clientY - move.startY) > 4) movedRef.current = true
+    setDyPct(pct)
+  }
+
+  const endMove = () => {
+    if (!move) return
+    const ratio = Math.min(80, Math.max(0, move.startMargin - dyPct)) / 100
+    setMove(null)
+    setDyPct(0)
+    if (movedRef.current) onGeometry?.({ positionRatio: Math.round(ratio * 1000) / 1000 })
+  }
+
+  const endResize = () => {
+    if (!resizing) return
+    setResizing(null)
+    const next = Math.min(2, Math.max(0.5, sizeScale * scaleFactor))
+    setScaleFactor(1)
+    if (Math.abs(next - sizeScale) > 0.005) {
+      onGeometry?.({ sizeScale: Math.round(next * 100) / 100 })
+    }
+  }
+
+  // Shared by the overlay (move release) and the resize handle, which captures
+  // the pointer so its own release never bubbles to the overlay.
+  const releasePointer = () => {
+    if (resizing) endResize()
+    else endMove()
+  }
 
   return (
     <div
-      className="pointer-events-none absolute inset-x-0 flex justify-center px-[6%]"
-      style={{ bottom: `${marginRatio * 100}%` }}
+      ref={boxRef}
+      className="pointer-events-auto absolute inset-x-0 flex touch-none justify-center px-[6%] select-none"
+      style={{ bottom: `${margin}%`, cursor: onGeometry ? 'move' : undefined }}
+      title={onGeometry ? 'Drag to move · corner handle resizes · double-click resets' : undefined}
+      onPointerDown={(e) => {
+        if (resizing) return
+        e.currentTarget.setPointerCapture(e.pointerId)
+        beginMove(e.clientY)
+      }}
+      onPointerMove={(e) => {
+        if (move && !resizing) trackMove(e.clientY)
+        if (resizing) {
+          const factor = 1 + (e.clientY - resizing.startY) / 250
+          if (Math.abs(e.clientY - resizing.startY) > 4) movedRef.current = true
+          setScaleFactor(Math.min(2.2, Math.max(0.4, factor)))
+        }
+      }}
+      onPointerUp={releasePointer}
+      onPointerCancel={() => {
+        setMove(null)
+        setDyPct(0)
+        setResizing(null)
+        setScaleFactor(1)
+      }}
+      onClickCapture={(e) => {
+        if (movedRef.current) {
+          e.stopPropagation()
+          movedRef.current = false
+        }
+      }}
+      onDoubleClick={(e) => {
+        e.stopPropagation()
+        onGeometry?.({ positionRatio: null })
+      }}
     >
       <p
-        className="text-center leading-[1.15]"
+        className="relative text-center leading-[1.15]"
         style={{
           fontFamily: style.preview.font === 'Anton' ? 'Anton, Impact, sans-serif' : undefined,
           fontSize: `clamp(0.75rem, ${sizeRatio * 100}cqh, 4rem)`,
@@ -485,6 +734,8 @@ function CaptionOverlay({
             : `0 0 ${outlineWidth}px #000, 0 0 ${outlineWidth * 2}px #000`,
           background: boxed ? 'rgba(0,0,0,0.78)' : undefined,
           padding: boxed ? '0.15em 0.4em' : undefined,
+          transform: scaleFactor !== 1 ? `scale(${scaleFactor})` : undefined,
+          transformOrigin: 'bottom center',
         }}
       >
         {active.map((word, index) => {
@@ -504,6 +755,27 @@ function CaptionOverlay({
             </span>
           )
         })}
+        {onGeometry && (
+          <span
+            role="button"
+            aria-label="Resize captions"
+            title="Drag to resize"
+            className="absolute -right-3 -bottom-2 size-4 cursor-nwse-resize rounded-[3px] border border-sodium-500/80 bg-ink-900/80"
+            onPointerDown={(e) => {
+              e.stopPropagation()
+              e.currentTarget.setPointerCapture(e.pointerId)
+              movedRef.current = false
+              setScaleFactor(1)
+              setResizing({ startY: e.clientY })
+            }}
+            onPointerUp={(e) => {
+              e.stopPropagation()
+              releasePointer()
+            }}
+            onClick={(e) => e.stopPropagation()}
+            onDoubleClick={(e) => e.stopPropagation()}
+          />
+        )}
       </p>
     </div>
   )

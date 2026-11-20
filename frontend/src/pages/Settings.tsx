@@ -234,6 +234,49 @@ export function Settings() {
             value={settings.export.loudness_lufs}
             onCommit={(value) => patch({ export: { ...settings.export, loudness_lufs: value } })}
           />
+          <NumberField
+            label="Caption size (× preset)"
+            value={settings.export.caption_size_scale}
+            onCommit={(value) =>
+              patch({
+                export: {
+                  ...settings.export,
+                  caption_size_scale: Math.min(2, Math.max(0.5, value)),
+                },
+              })
+            }
+          />
+          <div>
+            <NumberField
+              label="Caption height (% from bottom)"
+              value={Math.round((settings.export.caption_position_ratio ?? 0.24) * 100)}
+              disabled={settings.export.caption_position_ratio == null}
+              onCommit={(value) =>
+                patch({
+                  export: {
+                    ...settings.export,
+                    caption_position_ratio: Math.min(80, Math.max(0, value)) / 100,
+                  },
+                })
+              }
+            />
+            <label className="mt-2 flex items-center gap-2 text-xs text-ink-400">
+              <input
+                type="checkbox"
+                checked={settings.export.caption_position_ratio == null}
+                onChange={(e) =>
+                  patch({
+                    export: {
+                      ...settings.export,
+                      caption_position_ratio: e.target.checked ? null : 0.24,
+                    },
+                  })
+                }
+                className="size-3.5 accent-sodium-500"
+              />
+              Use each style&apos;s default position
+            </label>
+          </div>
         </div>
 
         <label className="mt-5 flex items-start gap-3 text-sm text-ink-200">
@@ -353,10 +396,12 @@ function Field({
 function NumberField({
   label,
   value,
+  disabled,
   onCommit,
 }: {
   label: string
   value: number
+  disabled?: boolean
   onCommit: (value: number) => void
 }) {
   const [draft, setDraft] = useState(String(value))
@@ -367,8 +412,9 @@ function NumberField({
       <span className="eyebrow">{label}</span>
       <input
         type="number"
-        className="field numeric mt-1 text-sm"
+        className="field numeric mt-1 text-sm disabled:opacity-40"
         value={draft}
+        disabled={disabled}
         onChange={(e) => setDraft(e.target.value)}
         onBlur={() => {
           const parsed = Number(draft)

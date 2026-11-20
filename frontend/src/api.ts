@@ -67,6 +67,11 @@ export interface Clip {
   user_trimmed: boolean
   caption_style: string
   ratio: string
+  crop_nudge: number
+  centre_crop: boolean
+  pip_enabled: boolean
+  pip_corner: string
+  pip_size: number
   exports: ExportRecord[]
 }
 
@@ -99,6 +104,15 @@ export interface CropPath {
   source_width: number
   source_height: number
   segments: CropSegment[]
+}
+
+export interface FacecamBox {
+  x: number
+  y: number
+  width: number
+  height: number
+  corner: string
+  coverage: number
 }
 
 export interface CaptionStyle {
@@ -142,6 +156,8 @@ export interface Settings {
   export: {
     ratio: string
     caption_style: string
+    caption_size_scale: number
+    caption_position_ratio: number | null
     loudness_lufs: number
     prefer_hardware_encoder: boolean
     crf: number
@@ -149,6 +165,16 @@ export interface Settings {
   }
   insecure_secret_storage: boolean
   keys_present: Record<string, boolean>
+}
+
+/** Partial settings update — the backend merges each section. */
+export type SettingsPatch = {
+  active_provider?: string
+  providers?: Record<string, { model: string; base_url: string | null }>
+  whisper?: Partial<Settings['whisper']>
+  clips?: Partial<Settings['clips']>
+  ingest?: Partial<Settings['ingest']>
+  export?: Partial<Settings['export']>
 }
 
 export interface SystemStatus {
@@ -266,24 +292,55 @@ export const api = {
 
   patchCaptions: (
     clipId: string,
-    patch: { words?: Word[]; caption_style?: string; ratio?: string },
+    patch: {
+      words?: Word[]
+      caption_style?: string
+      ratio?: string
+      crop_nudge?: number
+      centre_crop?: boolean
+      pip_enabled?: boolean
+      pip_corner?: string
+      pip_size?: number
+    },
   ) =>
     request<Clip>(`/api/clips/${clipId}/captions`, {
       method: 'PATCH',
       body: JSON.stringify(patch),
     }),
 
-  exportClip: (clipId: string, ratio: string, style: string, writeSrt = false) =>
+  exportClip: (
+    clipId: string,
+    ratio: string,
+    style: string,
+    writeSrt = false,
+    cropNudge?: number,
+    centreCrop?: boolean,
+    pip?: { enabled?: boolean; corner?: string; size?: number },
+  ) =>
     request<ExportRecord>(`/api/clips/${clipId}/export`, {
       method: 'POST',
-      body: JSON.stringify({ ratio, style, write_srt: writeSrt }),
+      body: JSON.stringify({
+        ratio,
+        style,
+        write_srt: writeSrt,
+        crop_nudge: cropNudge,
+        centre_crop: centreCrop,
+        pip_enabled: pip?.enabled,
+        pip_corner: pip?.corner,
+        pip_size: pip?.size,
+      }),
     }),
+
+  getFacecam: (clipId: string) => request<FacecamBox>(`/api/clips/${clipId}/facecam`),
+
+  detectFacecam: (clipId: string) =>
+    request<FacecamBox>(`/api/clips/${clipId}/facecam/detect`, { method: 'POST' }),
 
   captionStyles: () => request<CaptionStyle[]>('/api/caption-styles'),
   providerStatus: () => request<ProviderStatus[]>('/api/providers/status'),
 
   getSettings: () => request<Settings>('/api/settings'),
-  putSettings: (patch: Partial<Settings>) =>
+  putSettings: (patch: SettingsPatch) =>
     request<Settings>('/api/settings', { method: 'PUT', body: JSON.stringify(patch) }),
 
   putSecret: (key: string, value: string) =>
