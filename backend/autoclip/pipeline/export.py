@@ -46,6 +46,22 @@ class ExportError(RuntimeError):
 
 
 @dataclass
+class PipLayout:
+    """Picture-in-picture: full-screen background plus a facecam inset.
+
+    The box is source pixels (from facecam detection); the corner picks the
+    inset position and ``size_ratio`` its width as a fraction of output width.
+    """
+
+    x: float
+    y: float
+    width: float
+    height: float
+    corner: str = "tr"
+    size_ratio: float = 0.35
+
+
+@dataclass
 class ExportRequest:
     source: Path
     destination: Path
@@ -56,6 +72,7 @@ class ExportRequest:
     style: CaptionStyle
     ratio: str = "9:16"
     burn_captions: bool = True
+    pip: PipLayout | None = None
 
     @property
     def duration_s(self) -> float:
@@ -92,6 +109,55 @@ def build_video_filtergraph(
 ) -> str:
     """Build the ``-filter_complex`` video chain for one clip."""
     out_w, out_h = ratio_dimensions(request.ratio)
+
+    if request.pip is not None:
+        parts = _pip_chain(request.pip, out_w, out_h)
+        current = "[pip]"
+    else:
+        parts, current = _crop_chain(request, out_w, out_h)
+
+    if request.burn_captions and subtitle_name is not None:
+        # Bare relative names — ffmpeg runs with its cwd set to the render
+        # workspace, so there is nothing here that needs escaping.
+        parts.append(f"{current}ass=filename={subtitle_name}:fontsdir={fonts_name}[vout]")
+    else:
+        parts.append(f"{current}null[vout]")
+
+    return ";".join(parts)
+
+
+def _pip_chain(pip: PipLayout, out_w: int, out_h: int) -> list[str]:
+    """Full-screen background plus a facecam inset.
+
+    The background fits the whole source (blurred fill, like a too-wide shot)
+    so no screen content is cropped away; the inset is the detected facecam box
+    scaled to ``size_ratio`` of the output width in the chosen corner.
+    """
+    inset_w = max(2, round(out_w * pip.size_ratio) // 2 * 2)
+    inset_h = max(2, round(inset_w * pip.height / max(1.0, pip.width)) // 2 * 2)
+    margin = round(out_w * 0.022)
+    corners = {
+        "tl": (margin, margin),
+        "tr": (out_w - inset_w - margin, margin),
+        "bl": (margin, out_h - inset_h - margin),
+        "br": (out_w - inset_w - margin, out_h - inset_h - margin),
+    }
+    x, y = corners.get(pip.corner, corners["tr"])
+
+    face = (
+        f"[0:v]crop=w={round(pip.width)}:h={round(pip.height)}"
+        f":x={round(pip.x)}:y={round(pip.y)},"
+        f"scale={inset_w}:{inset_h}:flags=lanczos,setsar=1[face]"
+    )
+    return [
+        *_fit_chain("[0:v]", 9, out_w, out_h),
+        face,
+        f"[v9][face]overlay={x}:{y},setsar=1,format=yuv420p[pip]",
+    ]
+
+
+def _crop_chain(request: ExportRequest, out_w: int, out_h: int) -> tuple[list[str], str]:
+    """The standard tracked-crop chain; returns (parts, current label)."""
     segments = request.crop_path.segments
     if not segments:
         raise ExportError("The crop path has no segments.")
@@ -133,14 +199,7 @@ def build_video_filtergraph(
         parts.append(f"{''.join(labels)}concat=n={len(segments)}:v=1:a=0[vcat]")
         current = "[vcat]"
 
-    if request.burn_captions and subtitle_name is not None:
-        # Bare relative names — ffmpeg runs with its cwd set to the render
-        # workspace, so there is nothing here that needs escaping.
-        parts.append(f"{current}ass=filename={subtitle_name}:fontsdir={fonts_name}[vout]")
-    else:
-        parts.append(f"{current}null[vout]")
-
-    return ";".join(parts)
+    return parts, current
 
 
 def _fit_chain(source_label: str, index: int, out_w: int, out_h: int) -> list[str]:
