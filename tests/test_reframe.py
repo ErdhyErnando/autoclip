@@ -18,6 +18,7 @@ from autoclip.pipeline.reframe.croppath import (
     centre_crop,
     decimate,
     segment_crop_filter,
+    shift_crop_path,
     target_crop_size,
 )
 from autoclip.pipeline.reframe.faces import FaceObservation
@@ -74,6 +75,60 @@ class TestCentreCrop:
 
         assert path.segments[0].end_s == 42.5
         assert path.duration_s == 42.5
+
+
+class TestShiftCropPath:
+    def _path(self) -> croppath.CropPath:
+        # 1920-wide source, 608-wide crop: 1312px of travel.
+        return centre_crop(1920, 1080, 30.0)
+
+    def test_zero_returns_the_same_path(self) -> None:
+        path = self._path()
+
+        assert shift_crop_path(path, 0.0) is path
+
+    def test_full_right_parks_at_the_frame_edge(self) -> None:
+        shifted = shift_crop_path(self._path(), 1.0)
+        segment = shifted.segments[0]
+
+        assert segment.keyframes[0].x == pytest.approx(1920 - segment.width)
+
+    def test_full_left_parks_at_zero(self) -> None:
+        shifted = shift_crop_path(self._path(), -1.0)
+
+        assert shifted.segments[0].keyframes[0].x == pytest.approx(0.0)
+
+    def test_half_nudge_moves_half_the_travel(self) -> None:
+        path = self._path()
+        start_x = path.segments[0].keyframes[0].x
+        travel = 1920 - path.segments[0].width
+
+        shifted = shift_crop_path(path, 0.5)
+
+        assert shifted.segments[0].keyframes[0].x == pytest.approx(start_x + travel / 2)
+
+    def test_out_of_range_fractions_are_clamped(self) -> None:
+        assert shift_crop_path(self._path(), 5.0).segments[0].keyframes[0].x == pytest.approx(
+            1920 - self._path().segments[0].width
+        )
+        assert shift_crop_path(self._path(), -5.0).segments[0].keyframes[0].x == pytest.approx(0.0)
+
+    def test_y_and_strategy_survive_the_shift(self) -> None:
+        path = self._path()
+        keyframe = path.segments[0].keyframes[0]
+
+        shifted = shift_crop_path(path, 0.25).segments[0]
+
+        assert shifted.keyframes[0].y == pytest.approx(keyframe.y)
+        assert shifted.strategy is path.segments[0].strategy
+
+    def test_original_path_is_not_mutated(self) -> None:
+        path = self._path()
+        start_x = path.segments[0].keyframes[0].x
+
+        shift_crop_path(path, 1.0)
+
+        assert path.segments[0].keyframes[0].x == pytest.approx(start_x)
 
 
 class TestOneEuroFilter:

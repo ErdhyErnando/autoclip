@@ -205,6 +205,52 @@ def centre_crop(
     )
 
 
+def shift_crop_path(path: CropPath, fraction: float) -> CropPath:
+    """Shift a crop path horizontally by a fraction of its travel range.
+
+    ``fraction`` runs from -1 (hard left) through 0 (tracked position) to +1
+    (hard right). Each keyframe moves by ``fraction`` times that segment's
+    maximum travel (``source_width - segment.width``), clamped to the frame, so
+    a nudge means the same thing on every segment. Segments with no travel
+    (full-width crops and ``fit`` segments) are untouched.
+    """
+    clamped = min(1.0, max(-1.0, fraction))
+    if clamped == 0.0:
+        return path
+
+    shifted: list[CropSegment] = []
+    for segment in path.segments:
+        travel = path.source_width - segment.width
+        if travel <= 0 or segment.fit:
+            shifted.append(segment)
+            continue
+        delta = clamped * travel
+        shifted.append(
+            CropSegment(
+                start_s=segment.start_s,
+                end_s=segment.end_s,
+                width=segment.width,
+                height=segment.height,
+                keyframes=[
+                    CropKeyframe(
+                        t=k.t,
+                        x=min(travel, max(0.0, k.x + delta)),
+                        y=k.y,
+                    )
+                    for k in segment.keyframes
+                ],
+                strategy=segment.strategy,
+                zoom=segment.zoom,
+                fit=segment.fit,
+            )
+        )
+    return CropPath(
+        source_width=path.source_width,
+        source_height=path.source_height,
+        segments=shifted,
+    )
+
+
 def decimate(
     keyframes: list[CropKeyframe], *, limit: int = MAX_KEYFRAMES_PER_SEGMENT
 ) -> list[CropKeyframe]:
