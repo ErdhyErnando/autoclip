@@ -86,3 +86,26 @@ class TestPipFiltergraph:
 
         assert "overlay=" not in graph
         assert "[vout]" in graph
+
+
+class TestOutputFilename:
+    """Export filenames must disambiguate clips that share a title."""
+
+    def test_a_lone_title_has_no_variant(self) -> None:
+        assert export.output_filename("Go doc comments", "9:16") == ("go-doc-comments_9x16.mp4")
+
+    def test_a_variant_appends_the_rank_before_the_ratio(self) -> None:
+        assert export.output_filename("Go doc comments", "9:16", variant=3) == (
+            "go-doc-comments-3_9x16.mp4"
+        )
+
+    def test_same_titled_clips_now_get_distinct_names(self) -> None:
+        first = export.output_filename("Opening stretch", "9:16")
+        second = export.output_filename("Opening stretch", "9:16", variant=2)
+
+        assert first != second
+
+    def test_a_variant_survives_slugification_of_the_title(self) -> None:
+        # Slugification happens first; the variant is never stripped, so a
+        # rank-suffixed name can never collapse back onto the plain one.
+        assert export.output_filename("??", "1:1", variant=4) == "clip-4_1x1.mp4"

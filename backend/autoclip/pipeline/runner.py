@@ -365,14 +365,29 @@ class PipelineRunner:
         destination_dir = paths.exports_dir() / self.job.id
         destination_dir.mkdir(parents=True, exist_ok=True)
 
+        # Clips can share a title -- an LLM is free to reuse one -- and two
+        # exports to the same filename silently overwrite each other. The
+        # golden smoke run proved it: three clips titled alike, one file left
+        # on disk. Repeat titles get the clip's rank appended, which is unique
+        # per job, and the used-name loop closes the pathological case where a
+        # rank-suffixed slug happens to equal another clip's plain slug.
+        used_titles: set[str] = set()
+        used_names: set[str] = set()
+
         for index, clip in enumerate(clips):
             self._check_cancelled()
 
             crop_path = crop_paths.get(clip.id) or self._fallback_crop_path(clip, ratio)
             words = transcript.slice(clip.start_word, clip.end_word)
-            destination = destination_dir / export.output_filename(
-                clip.title or f"clip-{clip.rank}", ratio
-            )
+            title = clip.title or f"clip-{clip.rank}"
+            variant = clip.rank if title in used_titles else None
+            filename = export.output_filename(title, ratio, variant=variant)
+            while filename in used_names:
+                variant = (variant or 0) + 1
+                filename = export.output_filename(title, ratio, variant=variant)
+            used_titles.add(title)
+            used_names.add(filename)
+            destination = destination_dir / filename
 
             request = export.ExportRequest(
                 source=source_path,

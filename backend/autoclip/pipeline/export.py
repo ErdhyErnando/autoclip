@@ -92,8 +92,17 @@ def slugify_title(title: str, *, max_length: int = 50) -> str:
     return slug[:max_length] or "clip"
 
 
-def output_filename(title: str, ratio: str) -> str:
-    return f"{slugify_title(title)}_{ratio.replace(':', 'x')}.mp4"
+def output_filename(title: str, ratio: str, *, variant: int | None = None) -> str:
+    """The export filename for a clip title.
+
+    ``variant`` disambiguates clips that share a title — the rank, in practice,
+    which is unique per job. Without it two same-titled clips write one file
+    and the second export silently clobbers the first.
+    """
+    slug = slugify_title(title)
+    if variant is not None:
+        slug = f"{slug}-{variant}"
+    return f"{slug}_{ratio.replace(':', 'x')}.mp4"
 
 
 # --------------------------------------------------------------------------

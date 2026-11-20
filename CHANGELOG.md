@@ -61,6 +61,10 @@ Each of these was found by running the thing, not by reading it:
   skipped `None` values.
 - **Progress ran backwards** at every stage boundary, double-counting each
   completed stage.
+- **Clips that shared a title overwrote each other's exports.** The export
+  filename came from the title alone, so three same-titled clips wrote one
+  file and the last render silently won. The golden smoke run caught it on
+  real footage; repeat titles now get the clip's rank appended.
 - **A 9:16 preview rendered nearly square.** A max-height clamp shortened the box
   without narrowing it, silently violating the declared aspect ratio.
 - **The preview showed different framing from the export**, centre-cropping while
