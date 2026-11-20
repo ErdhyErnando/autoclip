@@ -73,7 +73,13 @@ class ClipSettings(BaseModel):
 
 class IngestSettings(BaseModel):
     #: yt-dlp format selector. Default caps at 1080p to keep downloads sane.
-    ytdlp_format: str = "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]"
+    #: H.264 first: YouTube wraps AV1 in mp4 containers too, and an AV1 source
+    #: downloads fine and then fails to decode on any ffmpeg build without AV1
+    #: support. Proven while acquiring the golden set.
+    ytdlp_format: str = (
+        "bestvideo[vcodec^=avc1][height<=1080]+bestaudio[ext=m4a]"
+        "/best[vcodec^=avc1][height<=1080]/best[height<=1080]"
+    )
     #: Browser to pull YouTube cookies from ("chrome", "firefox", "edge", ...).
     #: As of 2026 most anonymous YouTube downloads hit a bot check that only
     #: browser cookies reliably clear, so this is a first-class setting.
