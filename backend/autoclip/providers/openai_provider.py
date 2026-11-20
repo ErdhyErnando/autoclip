@@ -9,10 +9,35 @@ local LM Studio server. "Bring any API key" is mostly this file.
 from __future__ import annotations
 
 import logging
+import os
+import uuid
+from functools import lru_cache
 
 from .base import DetectionConfig, LLMProvider, ProviderError, ProviderStatus
 
 log = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _session_id() -> str:
+    """Stable session ID for this process (override with AUTOCLIP_OPENAI_SESSION_ID).
+
+    OpenCode Go requires ``x-opencode-session`` for routing/prompt caching.
+    All windows of one job run in the same process, so one ID per process
+    keeps a job on one route.
+    """
+    return os.environ.get("AUTOCLIP_OPENAI_SESSION_ID") or uuid.uuid4().hex
+
+
+def _extra_headers(base_url: str | None) -> dict[str, str] | None:
+    """Headers required by the OpenCode Go gateway, or None for other vendors."""
+    if base_url and "opencode.ai" in base_url:
+        return {
+            "x-opencode-session": _session_id(),
+            "User-Agent": "autoclip/0.1.0",
+        }
+    return None
+
 
 DEFAULT_MODEL = "gpt-4o"
 
@@ -68,6 +93,8 @@ class OpenAIProvider(LLMProvider):
 
     async def _complete(self, system: str, user: str, config: DetectionConfig) -> str:
         client = self._client()
+        extra = _extra_headers(self.base_url)
+        extra_kw = {"extra_headers": extra} if extra else {}
         request = {
             "model": self.model,
             "temperature": config.temperature,
@@ -80,13 +107,13 @@ class OpenAIProvider(LLMProvider):
         # it, so a failed request is retried once without it.
         try:
             response = await client.chat.completions.create(
-                **request, response_format={"type": "json_object"}
+                **request, response_format={"type": "json_object"}, **extra_kw
             )
         except Exception as exc:
             if _is_unsupported_parameter(exc):
                 log.debug("Endpoint rejected response_format; retrying without it.")
                 try:
-                    response = await client.chat.completions.create(**request)
+                    response = await client.chat.completions.create(**request, **extra_kw)
                 except Exception as retry_exc:
                     raise _translate(retry_exc, self.name, self.model) from retry_exc
             else:
