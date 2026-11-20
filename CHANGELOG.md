@@ -15,16 +15,23 @@ being validated against a fixed golden video set — see
   transcription with word-level timings, LLM highlight detection, speaker-tracked
   reframing, ASS caption generation, and export at 9:16 / 1:1 / 16:9.
 - **Four LLM providers** behind one interface: Anthropic, OpenAI-compatible (any
-  `base_url`, covering OpenRouter, Groq, DeepSeek, LM Studio), Google Gemini, and
+  `base_url`, covering OpenRouter, Groq, DeepSeek, LM Studio, and the OpenCode
+  gateway, which needs its own session headers), Google Gemini, and
   Ollama. Malformed responses are retried once with the validation error attached.
 - **Reframing** with shot detection, MediaPipe face tracking, active-speaker
   selection from mouth movement correlated against diarization, and a
   One Euro Filter with dead zone and velocity clamp. Shots are framed as TRACK,
   WIDE, or GENERAL; subjects too far apart to crop get a fitted frame over a
   blurred fill rather than someone being cut out.
+- **Picture-in-picture exports** — detect a stream VOD's persistent corner
+  facecam once per clip, cached with the job, and export the full screen behind
+  it as an inset, parked in your chosen corner and sized to taste.
 - **Four caption styles** with bundled OFL fonts, so nothing is fetched at runtime.
+- **Caption size and position** — global settings scale any preset's font and
+  set its height off the bottom; the review player's caption overlay is draggable
+  and resizable in place, writing the same values the renderer burns in.
 - **Web UI** — ingest, live job progress over SSE, clip review with word-snapping
-  trim handles and caption editing, and export.
+  trim handles, caption editing, crop nudging with a centre lock, and export.
 - **Resumable stages.** Artifacts live on disk per job, so a retry restarts at the
   stage that failed.
 - **`autoclip doctor`** — probes ffmpeg features, GPU acceleration, compute-type

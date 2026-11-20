@@ -25,7 +25,7 @@ Only transcript *text* is ever sent to a provider — never video or audio. With
 
 ## Status
 
-Working end to end: ingest, transcription, highlight detection across four providers, speaker-tracked reframing, four caption styles, export at three aspect ratios, and the full review UI. Verified on real footage — see [what "verified" means](#what-has-and-hasnt-been-verified).
+Working end to end: ingest, transcription, highlight detection across four providers, speaker-tracked reframing, four caption styles, export at three aspect ratios, and the full review UI. A stream VOD can export the full screen behind its detected facecam as an inset, and every clip's framing can be nudged or centre-locked from the review page. Verified on real footage — see [what "verified" means](#what-has-and-hasnt-been-verified).
 
 Pre-1.0. The reframe quality bar hasn't been validated against a fixed golden set yet, which is the gate for tagging v0.1.0.
 
@@ -208,7 +208,7 @@ Deliberate, not oversights:
 
 - **No direct posting** to TikTok/Instagram/YouTube. Their APIs are approval-gated; AutoClip exports files.
 - **No cloud version, no accounts, no telemetry.**
-- **No timeline editor** beyond trim handles and caption edits.
+- **No timeline editor** beyond trim handles, caption edits, and framing corrections.
 - **No DRM circumvention**, ever.
 
 ## Contributing
