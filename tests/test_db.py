@@ -265,6 +265,45 @@ class TestTranscriptsEditsAndExports:
         assert loaded.edited_words == words
         assert loaded.caption_style == "karaoke_fill"
 
+    def test_clip_edit_round_trips_framing_corrections(self, job: Job) -> None:
+        clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
+        store.replace_clips(job.id, [clip])
+
+        store.upsert_clip_edit(ClipEdit(clip_id=clip.id, crop_nudge=0.5, centre_crop=True))
+
+        loaded = store.get_clip_edit(clip.id)
+        assert loaded is not None
+        assert loaded.crop_nudge == pytest.approx(0.5)
+        assert loaded.centre_crop is True
+
+        # A later edit that only touches words must preserve the framing.
+        store.upsert_clip_edit(
+            ClipEdit(
+                clip_id=clip.id,
+                edited_words=[{"word": "Hi", "start": 0.0, "end": 0.4}],
+                crop_nudge=loaded.crop_nudge,
+                centre_crop=loaded.centre_crop,
+            )
+        )
+        reloaded = store.get_clip_edit(clip.id)
+        assert reloaded is not None
+        assert reloaded.crop_nudge == pytest.approx(0.5)
+        assert reloaded.centre_crop is True
+
+    def test_clip_edit_round_trips_pip_settings(self, job: Job) -> None:
+        clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
+        store.replace_clips(job.id, [clip])
+
+        store.upsert_clip_edit(
+            ClipEdit(clip_id=clip.id, pip_enabled=True, pip_corner="bl", pip_size=0.4)
+        )
+
+        loaded = store.get_clip_edit(clip.id)
+        assert loaded is not None
+        assert loaded.pip_enabled is True
+        assert loaded.pip_corner == "bl"
+        assert loaded.pip_size == pytest.approx(0.4)
+
     def test_exports_are_listed_for_a_clip(self, job: Job) -> None:
         clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
         store.replace_clips(job.id, [clip])

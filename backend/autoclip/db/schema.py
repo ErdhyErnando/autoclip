@@ -104,9 +104,32 @@ def _migration_v1(conn: sqlite3.Connection) -> None:
     conn.executescript(_V1)
 
 
+def _migration_v2(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        ALTER TABLE clip_edits ADD COLUMN crop_nudge REAL NOT NULL DEFAULT 0;
+        ALTER TABLE clip_edits ADD COLUMN centre_crop INTEGER NOT NULL DEFAULT 0;
+        """
+    )
+
+
+def _migration_v3(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        ALTER TABLE clip_edits ADD COLUMN pip_enabled INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE clip_edits ADD COLUMN pip_corner TEXT NOT NULL DEFAULT 'auto';
+        ALTER TABLE clip_edits ADD COLUMN pip_size REAL NOT NULL DEFAULT 0.35;
+        """
+    )
+
+
 #: Ordered migrations. Index + 1 is the resulting ``user_version``.
 #: Append only — never edit a migration that has shipped.
-MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_migration_v1]
+MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
+    _migration_v1,
+    _migration_v2,
+    _migration_v3,
+]
 
 SCHEMA_VERSION = len(MIGRATIONS)
 

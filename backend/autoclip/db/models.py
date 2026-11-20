@@ -172,16 +172,36 @@ class ClipEdit:
     edited_words: list[dict[str, Any]] | None = None
     caption_style: str = "bold_pop"
     ratio: str = "9:16"
+    #: Manual horizontal nudge of the tracked crop window, -1 (left) to +1 (right).
+    crop_nudge: float = 0.0
+    #: Ignore tracking and render a static centre crop instead.
+    centre_crop: bool = False
+    #: Picture-in-picture: facecam inset over a full-screen background.
+    pip_enabled: bool = False
+    #: Inset corner: "auto" follows the detected facecam corner.
+    pip_corner: str = "auto"
+    #: Inset width as a fraction of output width.
+    pip_size: float = 0.35
     updated_at: str = field(default_factory=utcnow)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> ClipEdit:
         raw = row["edited_words_json"]
+        keys = row.keys()
+
+        def _col(name: str, default):
+            return row[name] if name in keys else default
+
         return cls(
             clip_id=row["clip_id"],
             edited_words=json.loads(raw) if raw else None,
             caption_style=row["caption_style"],
             ratio=row["ratio"],
+            crop_nudge=_col("crop_nudge", 0.0),
+            centre_crop=bool(_col("centre_crop", 0)),
+            pip_enabled=bool(_col("pip_enabled", 0)),
+            pip_corner=_col("pip_corner", "auto"),
+            pip_size=_col("pip_size", 0.35),
             updated_at=row["updated_at"],
         )
 
