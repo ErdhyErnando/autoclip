@@ -5,9 +5,15 @@ versions follow [semantic versioning](https://semver.org/) once 0.1.0 ships.
 
 ## Unreleased
 
-Everything so far. The first tagged release waits on the reframe acceptance bar
-being validated against a fixed golden video set — see
-[the README](README.md#what-has-and-hasnt-been-verified).
+Nothing yet. Validation work after the release lands here — the golden-set
+machinery is [docs/goldens.md](docs/goldens.md).
+
+## 0.1.0 — 2026-11-20
+
+The first tagged release. The reframe acceptance bar was validated against a
+fixed golden set — three scenarios (solo-speaker, screen-content,
+facecam-stream-vod), automated pass plus a per-scenario human checklist; the
+multi-speaker scenario is the gate for 0.1.1.
 
 ### Added
 
@@ -61,6 +67,10 @@ Each of these was found by running the thing, not by reading it:
   skipped `None` values.
 - **Progress ran backwards** at every stage boundary, double-counting each
   completed stage.
+- **YouTube can serve AV1 inside an mp4** that the pinned format selector
+  happily downloaded — and no pipeline stage could decode it. Proven while
+  acquiring goldens: three downloads, one undecodable. The default selector
+  now asks for H.264 (avc1) first and only falls back to whatever exists.
 - **Clips that shared a title overwrote each other's exports.** The export
   filename came from the title alone, so three same-titled clips wrote one
   file and the last render silently won. The golden smoke run caught it on

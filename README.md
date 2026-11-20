@@ -27,7 +27,10 @@ Only transcript *text* is ever sent to a provider — never video or audio. With
 
 Working end to end: ingest, transcription, highlight detection across four providers, speaker-tracked reframing, four caption styles, export at three aspect ratios, and the full review UI. A stream VOD can export the full screen behind its detected facecam as an inset, and every clip's framing can be nudged or centre-locked from the review page. Verified on real footage — see [what "verified" means](#what-has-and-hasnt-been-verified).
 
-Pre-1.0. The reframe quality bar hasn't been validated against a fixed golden set yet, which is the gate for tagging v0.1.0.
+v0.1.0 is tagged. The reframe quality bar is validated against a fixed golden
+set — three scenarios, automated pass plus a per-scenario human checklist
+([docs/goldens.md](docs/goldens.md)). Multi-speaker reframing is the open gap;
+v0.1.1 waits on it.
 
 ## Requirements
 
@@ -198,7 +201,21 @@ Each stage writes artifacts to `~/.autoclip/work/{job_id}/`, so a retry resumes 
 AUTOCLIP_E2E_MEDIA=/path/to/clip.mp4 pytest -m e2e
 ```
 
-**Hasn't been:** the §6.4 reframe acceptance bar — no visible jitter, no cut-off faces, speaker on screen ≥95% of speaking time — against a fixed three-video golden set. The mechanics have unit coverage, but "looks right on footage I picked" isn't the bar. This is the gate for v0.1.0.
+At v0.1.0 the reframe acceptance pass is also green over a three-scenario golden
+set — `AUTOCLIP_GOLDEN_MEDIA=<dir> pytest -m golden` runs the whole pipeline per
+golden (transcription, MediaPipe tracking, facecam detection, exports at 1:1,
+16:9 and picture-in-picture) and asserts stage completion, crop tiling and
+frame bounds, the facecam verdict per scenario, and renders with real picture.
+Validated scenarios: solo-speaker (a TED talk, CC BY-NC-ND), screen-content
+(a narrated LibreOffice screencast, Wikimedia Commons), and a 45-minute stream
+VOD with a corner facecam. Each golden is pinned by sha256, and the manual
+per-scenario checklist lives in [docs/goldens.md](docs/goldens.md).
+
+**Hasn't been:** multi-speaker crop switching — the golden set has no
+multi-speaker entry yet, so the cut-to-the-speaker behaviour is validated only
+by the e2e test above, not the acceptance pass. It is the gate for v0.1.1.
+The quantitative bar (speaker on screen ≥95% of speaking time) is judged by
+eye through the checklist rather than measured.
 
 Also unverified: whether the clip *picks* are good. That's a judgement call about your material and your model, and no test settles it.
 
