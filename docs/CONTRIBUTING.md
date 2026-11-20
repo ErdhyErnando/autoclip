@@ -38,6 +38,13 @@ pytest -m slow          # real ffmpeg renders; slower, worth it
 cd frontend && npm run build
 ```
 
+The reframe acceptance pass needs the golden video set, which lives outside
+the repo — see [goldens.md](goldens.md) for acquiring and running it:
+
+```bash
+AUTOCLIP_GOLDEN_MEDIA=<dir> pytest -m golden
+```
+
 CI runs all of this on Linux, macOS, and Windows. The Windows leg is not
 decoration — filtergraph path escaping and keyring behaviour genuinely differ
 there, and both have already produced bugs.
