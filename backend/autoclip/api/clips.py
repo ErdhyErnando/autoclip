@@ -270,28 +270,40 @@ async def job_media(job_id: str) -> FileResponse:
 
 @router.get("/caption-styles", response_model=list[CaptionStyleOut])
 async def caption_styles() -> list[CaptionStyleOut]:
-    """Style presets, with enough detail for the UI to approximate them in CSS."""
-    return [
-        CaptionStyleOut(
-            key=style.key,
-            label=style.label,
-            description=style.description,
-            preview={
-                "font": style.font,
-                "primary": style.primary,
-                "accent": style.accent,
-                "outline": style.outline,
-                "outlineWidth": style.outline_width,
-                "allCaps": style.all_caps,
-                "sizeRatio": style.size_ratio,
-                "marginRatio": style.margin_v_ratio,
-                "boxed": style.boxed,
-                "animation": style.animation,
-                "maxWords": style.max_words,
-            },
+    """Style presets, with enough detail for the UI to approximate them in CSS.
+
+    The preview carries the user's size/position overrides, so what the review
+    player draws matches what the renderer burns in.
+    """
+    settings = load_settings()
+    out = []
+    for style in captions_module.PRESETS.values():
+        effective = captions_module.resolve_style(
+            style.key,
+            size_scale=settings.export.caption_size_scale,
+            position_ratio=settings.export.caption_position_ratio,
         )
-        for style in captions_module.PRESETS.values()
-    ]
+        out.append(
+            CaptionStyleOut(
+                key=style.key,
+                label=style.label,
+                description=style.description,
+                preview={
+                    "font": style.font,
+                    "primary": style.primary,
+                    "accent": style.accent,
+                    "outline": style.outline,
+                    "outlineWidth": style.outline_width,
+                    "allCaps": style.all_caps,
+                    "sizeRatio": effective.size_ratio,
+                    "marginRatio": effective.margin_v_ratio,
+                    "boxed": style.boxed,
+                    "animation": style.animation,
+                    "maxWords": style.max_words,
+                },
+            )
+        )
+    return out
 
 
 # --------------------------------------------------------------------------

@@ -218,3 +218,41 @@ class TestAssGeneration:
 
         assert path.exists()
         assert len(pysubs2.load(str(path), encoding="utf-8").events) > 0
+
+
+class TestResolveStyle:
+    def test_defaults_return_the_preset_untouched(self) -> None:
+        preset = captions.get_style("bold_pop")
+
+        assert captions.resolve_style("bold_pop") is preset
+
+    def test_size_scale_multiplies_font_size_only(self) -> None:
+        preset = captions.get_style("bold_pop")
+
+        resolved = captions.resolve_style("bold_pop", size_scale=1.5)
+
+        assert resolved.size_ratio == pytest.approx(preset.size_ratio * 1.5)
+        assert resolved.margin_v_ratio == preset.margin_v_ratio
+        # The shared preset must not be mutated.
+        assert preset.size_ratio == pytest.approx(0.062)
+
+    def test_position_override_replaces_preset_margin(self) -> None:
+        resolved = captions.resolve_style("karaoke_fill", position_ratio=0.1)
+
+        assert resolved.margin_v_ratio == pytest.approx(0.1)
+
+    def test_out_of_range_inputs_are_clamped(self) -> None:
+        preset = captions.get_style("boxed")
+
+        assert captions.resolve_style("boxed", size_scale=5.0).size_ratio == pytest.approx(
+            preset.size_ratio * 2.0
+        )
+        assert captions.resolve_style("boxed", size_scale=0.1).size_ratio == pytest.approx(
+            preset.size_ratio * 0.5
+        )
+        assert captions.resolve_style("boxed", position_ratio=0.99).margin_v_ratio == pytest.approx(
+            0.8
+        )
+        assert captions.resolve_style("boxed", position_ratio=-0.5).margin_v_ratio == pytest.approx(
+            0.0
+        )

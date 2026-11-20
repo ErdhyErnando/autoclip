@@ -85,6 +85,11 @@ class IngestSettings(BaseModel):
 class ExportSettings(BaseModel):
     ratio: Literal["9:16", "1:1", "16:9"] = "9:16"
     caption_style: str = "bold_pop"
+    #: Multiplier on the preset's font size. 1.0 is the preset as authored.
+    caption_size_scale: float = Field(default=1.0, ge=0.5, le=2.0)
+    #: Distance of captions from the bottom of the frame, as a fraction of
+    #: frame height. None means the preset's own value.
+    caption_position_ratio: float | None = Field(default=None, ge=0.0, le=0.8)
     #: Integrated loudness target in LUFS. -14 is the de-facto platform standard.
     loudness_lufs: float = -14.0
     #: Use h264_nvenc when the hardware supports it. Falls back to libx264.

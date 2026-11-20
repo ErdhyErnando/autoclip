@@ -294,6 +294,14 @@ def export_clip(
     settings = settings or ExportSettings()
     out_w, out_h = ratio_dimensions(request.ratio)
 
+    # The request carries the preset; the user's size/position overrides live in
+    # settings so one change applies to pipeline exports and re-exports alike.
+    style = captions_module.resolve_style(
+        request.style.key,
+        size_scale=settings.caption_size_scale,
+        position_ratio=settings.caption_position_ratio,
+    )
+
     # Each clip renders in its own workspace so concurrent exports can't collide
     # on the shared `captions.ass` name that the relative-path scheme requires.
     workspace = work_dir / request.destination.stem
@@ -307,7 +315,7 @@ def export_clip(
         ass_path = captions_module.write_ass(
             workspace / "captions.ass",
             request.words,
-            request.style,
+            style,
             width=out_w,
             height=out_h,
             time_offset_s=request.start_s,

@@ -13,7 +13,7 @@ it's why event counts look high relative to word counts.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pysubs2
@@ -174,6 +174,23 @@ def get_style(key: str) -> CaptionStyle:
     if style is None:
         raise ValueError(f"Unknown caption style {key!r}. Available: {', '.join(PRESETS)}")
     return style
+
+
+def resolve_style(
+    key: str, *, size_scale: float = 1.0, position_ratio: float | None = None
+) -> CaptionStyle:
+    """Return a preset with the user's size/position overrides applied.
+
+    ``size_scale`` multiplies the preset's font size; ``position_ratio``
+    replaces its distance-from-bottom when set. Out-of-range inputs are clamped
+    rather than rejected, so a stale config can never break a render.
+    """
+    style = get_style(key)
+    scale = min(2.0, max(0.5, size_scale))
+    margin = style.margin_v_ratio if position_ratio is None else min(0.8, max(0.0, position_ratio))
+    if scale == 1.0 and margin == style.margin_v_ratio:
+        return style
+    return replace(style, size_ratio=style.size_ratio * scale, margin_v_ratio=margin)
 
 
 # --------------------------------------------------------------------------
