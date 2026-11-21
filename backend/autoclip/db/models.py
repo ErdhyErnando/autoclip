@@ -182,6 +182,15 @@ class ClipEdit:
     pip_corner: str = "auto"
     #: Inset width as a fraction of output width.
     pip_size: float = 0.35
+    #: Per-clip caption styling, layered over the base preset. None means the
+    #: clip has no overrides and resolves to the preset alone.
+    style_overrides: dict[str, Any] | None = None
+    #: Distance of the captions from the bottom, as a fraction of frame height.
+    #: None falls through to the legacy global, then to the preset.
+    caption_margin_ratio: float | None = None
+    #: Horizontal caption anchor, 0 (left edge) to 1 (right edge). None means
+    #: horizontally centred, which is what every clip did before this existed.
+    caption_x_ratio: float | None = None
     updated_at: str = field(default_factory=utcnow)
 
     @classmethod
@@ -191,6 +200,8 @@ class ClipEdit:
 
         def _col(name: str, default):
             return row[name] if name in keys else default
+
+        raw_overrides = _col("style_overrides_json", None)
 
         return cls(
             clip_id=row["clip_id"],
@@ -202,6 +213,9 @@ class ClipEdit:
             pip_enabled=bool(_col("pip_enabled", 0)),
             pip_corner=_col("pip_corner", "auto"),
             pip_size=_col("pip_size", 0.35),
+            style_overrides=json.loads(raw_overrides) if raw_overrides else None,
+            caption_margin_ratio=_col("caption_margin_ratio", None),
+            caption_x_ratio=_col("caption_x_ratio", None),
             updated_at=row["updated_at"],
         )
 

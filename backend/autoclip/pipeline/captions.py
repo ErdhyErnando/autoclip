@@ -13,8 +13,11 @@ it's why event counts look high relative to word counts.
 from __future__ import annotations
 
 import logging
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 import pysubs2
 
@@ -23,6 +26,45 @@ from .transcript import Word
 log = logging.getLogger(__name__)
 
 FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+
+#: ``#RRGGBB``. Shared with the API schemas so what the request layer accepts and
+#: what the resolver is willing to store can never disagree.
+COLOUR_PATTERN = r"^#[0-9A-Fa-f]{6}$"
+_COLOUR_RE = re.compile(COLOUR_PATTERN)
+
+
+@dataclass(frozen=True)
+class FontSpec:
+    """One font bundled with the app.
+
+    ``key`` is the ASS family name, and is also the key the API's ``font`` field
+    carries. libass resolves a family from the TTF, so introducing a separate
+    registry key would only add a mapping that can drift from the file it points
+    at.
+    """
+
+    key: str
+    label: str
+    file: str
+
+    @property
+    def path(self) -> Path:
+        return FONT_DIR / self.file
+
+
+#: Every font the renderer may name (contract §5). All SIL OFL, committed to
+#: git — nothing is fetched at runtime, so exporting works offline.
+FONTS: dict[str, FontSpec] = {
+    "Anton": FontSpec(key="Anton", label="Anton", file="Anton-Regular.ttf"),
+    "Inter": FontSpec(key="Inter", label="Inter", file="Inter-Variable.ttf"),
+}
+
+
+def get_font(key: str) -> FontSpec:
+    spec = FONTS.get(key)
+    if spec is None:
+        raise ValueError(f"Unknown font {key!r}. Available: {', '.join(FONTS)}")
+    return spec
 
 #: Words are grouped into caption events; more than this is hard to read at a
 #: glance on a phone.
@@ -33,6 +75,96 @@ DEFAULT_MAX_GAP_S = 0.4
 #: Reference canvas. Styles are authored against this and scaled to the real
 #: output size, so a preset looks identical at 9:16, 1:1, and 16:9.
 REFERENCE_HEIGHT = 1920
+
+#: Guard rails for per-clip inputs (contract §1-§2). Values outside these are
+#: clamped, never rejected: a stored override written by another build must not
+#: be able to break a render.
+SIZE_RATIO_RANGE = (0.02, 0.12)
+OUTLINE_WIDTH_RANGE = (0.0, 8.0)
+MAX_WORDS_RANGE = (1, 8)
+BOX_ALPHA_RANGE = (0, 255)
+MARGIN_RATIO_RANGE = (0.0, 0.8)
+X_RATIO_RANGE = (0.0, 1.0)
+#: A position within this of centre counts as centred. The review UI applies the
+#: same tolerance before it sends, so a drag that lands "centred enough" renders
+#: centred instead of left-aligned against a hair-thin margin.
+X_SNAP_TOLERANCE = 0.04
+
+#: The animation modes a style may name.
+ANIMATIONS = ("scale", "karaoke", "none")
+
+
+def clamp(value: float, bounds: tuple[float, float]) -> float:
+    low, high = bounds
+    return min(high, max(low, value))
+
+
+def _number(value: Any) -> float | None:
+    """Read an override value as a float, or None if it isn't one.
+
+    ``bool`` is excluded on purpose: JSON booleans are ints in Python, and a
+    ``true`` in a numeric field is a mistake rather than a size of one.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _colour(value: Any) -> str | None:
+    return value if isinstance(value, str) and _COLOUR_RE.match(value) else None
+
+
+def clamp_overrides(raw: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Clamp a style-override blob to the ranges in contract §1.
+
+    Used on write, so what lands in the database is always in range, and again
+    on read, so a blob written by another build still renders. Unknown keys and
+    unparseable values are dropped rather than raised: the API turns bad input
+    into a 400, but resolution must never fail part-way through a render.
+    """
+    if not raw:
+        return {}
+
+    out: dict[str, Any] = {}
+
+    for name, bounds, whole in (
+        ("size_ratio", SIZE_RATIO_RANGE, False),
+        ("outline_width", OUTLINE_WIDTH_RANGE, False),
+        ("box_alpha", BOX_ALPHA_RANGE, True),
+        ("max_words", MAX_WORDS_RANGE, True),
+    ):
+        number = _number(raw.get(name))
+        if number is not None:
+            bounded = clamp(number, bounds)
+            out[name] = int(bounded) if whole else bounded
+
+    if raw.get("font") in FONTS:
+        out["font"] = raw["font"]
+
+    for name in ("primary", "outline", "box_colour"):
+        colour = _colour(raw.get(name))
+        if colour is not None:
+            out[name] = colour
+
+    # ``accent`` accepts an explicit null: that is how per-word highlighting gets
+    # switched off, and it has to stay distinguishable from "leave the preset
+    # alone", which is an absent key.
+    if "accent" in raw:
+        accent = raw["accent"]
+        colour = _colour(accent)
+        if colour is not None:
+            out["accent"] = colour
+        elif accent is None:
+            out["accent"] = None
+
+    for name in ("all_caps", "boxed"):
+        if isinstance(raw.get(name), bool):
+            out[name] = raw[name]
+
+    if raw.get("animation") in ANIMATIONS:
+        out["animation"] = raw["animation"]
+
+    return out
 
 
 def hex_to_ass(colour: str, alpha: int = 0) -> pysubs2.Color:
@@ -71,7 +203,6 @@ class CaptionStyle:
     description: str
 
     font: str = "Anton"
-    font_file: str = "Anton-Regular.ttf"
     #: Font size as a fraction of frame height, so presets scale across ratios.
     size_ratio: float = 0.058
     primary: str = "#FFFFFF"
@@ -93,10 +224,24 @@ class CaptionStyle:
     boxed: bool = False
     box_colour: str = "#000000"
     box_alpha: int = 40
+    #: Horizontal anchor, 0 at the left edge and 1 at the right. None is
+    #: horizontally centred, which is all that existed before x-axis placement.
+    x_ratio: float | None = None
 
     @property
     def font_path(self) -> Path:
-        return FONT_DIR / self.font_file
+        return get_font(self.font).path
+
+    @property
+    def alignment(self) -> str:
+        """Which edge the caption block is anchored to (contract §2).
+
+        Derived rather than stored so the preview payload and the ASS style can
+        never disagree about it: both read this.
+        """
+        if self.x_ratio is None:
+            return "center"
+        return "left" if self.x_ratio < 0.5 else "right"
 
 
 PRESETS: dict[str, CaptionStyle] = {
@@ -105,7 +250,6 @@ PRESETS: dict[str, CaptionStyle] = {
         label="Bold Pop",
         description="Chunky white with a heavy outline; the spoken word grows and turns yellow.",
         font="Anton",
-        font_file="Anton-Regular.ttf",
         size_ratio=0.062,
         primary="#FFFFFF",
         accent="#FFE500",
@@ -120,7 +264,6 @@ PRESETS: dict[str, CaptionStyle] = {
         label="Karaoke Fill",
         description="Words fill with colour exactly as they're spoken.",
         font="Anton",
-        font_file="Anton-Regular.ttf",
         size_ratio=0.058,
         primary="#FFFFFF",
         accent="#31E981",
@@ -134,7 +277,6 @@ PRESETS: dict[str, CaptionStyle] = {
         label="Clean Lower",
         description="Minimal lower third, no animation. For talks and professional cuts.",
         font="Inter",
-        font_file="Inter-Variable.ttf",
         size_ratio=0.034,
         primary="#FFFFFF",
         accent=None,
@@ -151,7 +293,6 @@ PRESETS: dict[str, CaptionStyle] = {
         label="Boxed",
         description="High-contrast text on a solid block. Readable on any footage.",
         font="Anton",
-        font_file="Anton-Regular.ttf",
         size_ratio=0.052,
         primary="#FFFFFF",
         accent="#FF4D4D",
@@ -177,20 +318,102 @@ def get_style(key: str) -> CaptionStyle:
 
 
 def resolve_style(
-    key: str, *, size_scale: float = 1.0, position_ratio: float | None = None
+    key: str,
+    *,
+    size_scale: float = 1.0,
+    position_ratio: float | None = None,
+    overrides: Mapping[str, Any] | None = None,
+    caption_margin_ratio: float | None = None,
+    caption_x_ratio: float | None = None,
 ) -> CaptionStyle:
-    """Return a preset with the user's size/position overrides applied.
+    """Resolve a preset plus everything the user layered on top of it.
 
-    ``size_scale`` multiplies the preset's font size; ``position_ratio``
-    replaces its distance-from-bottom when set. Out-of-range inputs are clamped
-    rather than rejected, so a stale config can never break a render.
+    Highest wins (contract §1):
+
+    1. ``overrides`` — the clip's own style blob
+    2. ``caption_margin_ratio`` / ``caption_x_ratio`` — the clip's own geometry
+    3. ``size_scale`` / ``position_ratio`` — the legacy global knobs, kept as a
+       transition layer until #10 seeds a default preset from their values
+    4. the preset itself
+
+    Layer 3 sitting above the preset is not a misreading: it is today's
+    behaviour, and no-override output has to stay byte-identical for an existing
+    user (contract §8.3).
+
+    Every numeric input is clamped rather than rejected, so a stale stored value
+    can never break a render. Unknown values are ignored for the same reason —
+    turning bad input into a 400 is the API layer's job.
     """
     style = get_style(key)
-    scale = min(2.0, max(0.5, size_scale))
-    margin = style.margin_v_ratio if position_ratio is None else min(0.8, max(0.0, position_ratio))
-    if scale == 1.0 and margin == style.margin_v_ratio:
-        return style
-    return replace(style, size_ratio=style.size_ratio * scale, margin_v_ratio=margin)
+    changes: dict[str, Any] = {}
+
+    scale = clamp(size_scale, (0.5, 2.0))
+    if scale != 1.0:
+        changes["size_ratio"] = style.size_ratio * scale
+
+    margin = style.margin_v_ratio
+    if position_ratio is not None:
+        margin = clamp(position_ratio, MARGIN_RATIO_RANGE)
+    if caption_margin_ratio is not None:
+        margin = clamp(caption_margin_ratio, MARGIN_RATIO_RANGE)
+    if margin != style.margin_v_ratio:
+        changes["margin_v_ratio"] = margin
+
+    x_ratio = caption_x_ratio
+    if x_ratio is not None:
+        x_ratio = clamp(x_ratio, X_RATIO_RANGE)
+        # Centring here as well as in the UI costs one comparison and closes the
+        # band where a "centred" caption would render left-aligned with a
+        # margin thinner than its own outline.
+        if abs(x_ratio - 0.5) <= X_SNAP_TOLERANCE:
+            x_ratio = None
+    if x_ratio is not None:
+        changes["x_ratio"] = x_ratio
+
+    clamped = clamp_overrides(overrides)
+    for name in (
+        "font",
+        "size_ratio",
+        "primary",
+        "accent",
+        "outline",
+        "outline_width",
+        "all_caps",
+        "animation",
+        "max_words",
+        "boxed",
+        "box_colour",
+        "box_alpha",
+    ):
+        if name in clamped:
+            changes[name] = clamped[name]
+
+    return replace(style, **changes) if changes else style
+
+
+def preview_payload(style: CaptionStyle) -> dict[str, Any]:
+    """The resolved snapshot, for the preview and the exporter alike.
+
+    One builder for ``/api/caption-styles`` and each clip's ``effective_caption``
+    so the review player and the renderer cannot drift (contract §8.1). Keys are
+    camelCase where the UI already reads them; the two geometry keys stay
+    snake_case because §3 names them that way.
+    """
+    return {
+        "font": style.font,
+        "primary": style.primary,
+        "accent": style.accent,
+        "outline": style.outline,
+        "outlineWidth": style.outline_width,
+        "allCaps": style.all_caps,
+        "sizeRatio": style.size_ratio,
+        "marginRatio": style.margin_v_ratio,
+        "boxed": style.boxed,
+        "animation": style.animation,
+        "maxWords": style.max_words,
+        "alignment": style.alignment,
+        "margin_ratio": style.margin_v_ratio,
+    }
 
 
 # --------------------------------------------------------------------------

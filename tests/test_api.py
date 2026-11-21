@@ -85,6 +85,29 @@ class TestHealthAndSystem:
         assert client.get("/api/does-not-exist").status_code == 404
 
 
+@pytest.fixture
+def job_with_clips(source: Source) -> Job:
+    job = store.create_job(Job(id=new_id(), source_id=source.id, status="done"))
+    store.replace_clips(
+        job.id,
+        [
+            Clip(
+                id=new_id(),
+                job_id=job.id,
+                rank=rank,
+                start_s=rank * 60.0,
+                end_s=rank * 60.0 + 40.0,
+                start_word=rank * 100,
+                end_word=rank * 100 + 80,
+                title=f"Clip {rank}",
+                score=90 - rank,
+            )
+            for rank in (1, 2, 3)
+        ],
+    )
+    return job
+
+
 class TestCaptionStyles:
     def test_lists_all_four(self, client: TestClient) -> None:
         styles = client.get("/api/caption-styles").json()
@@ -268,28 +291,6 @@ class TestJobs:
 
 
 class TestClips:
-    @pytest.fixture
-    def job_with_clips(self, source: Source) -> Job:
-        job = store.create_job(Job(id=new_id(), source_id=source.id, status="done"))
-        store.replace_clips(
-            job.id,
-            [
-                Clip(
-                    id=new_id(),
-                    job_id=job.id,
-                    rank=rank,
-                    start_s=rank * 60.0,
-                    end_s=rank * 60.0 + 40.0,
-                    start_word=rank * 100,
-                    end_word=rank * 100 + 80,
-                    title=f"Clip {rank}",
-                    score=90 - rank,
-                )
-                for rank in (1, 2, 3)
-            ],
-        )
-        return job
-
     def test_list_clips_for_a_job(self, client: TestClient, job_with_clips: Job) -> None:
         clips = client.get(f"/api/jobs/{job_with_clips.id}/clips").json()
 
@@ -532,6 +533,195 @@ class TestExportFilenames:
         client.post(f"/api/clips/{clip_id}/export", json={"ratio": "1:1"})
 
         assert len(set(rendered)) == 2
+
+
+class TestCaptionOverrides:
+    """Per-clip styling: storage, merge semantics, and the resolved snapshot."""
+
+    @pytest.fixture
+    def clip_id(self, client: TestClient, job_with_clips: Job) -> str:
+        return client.get(f"/api/jobs/{job_with_clips.id}/clips").json()[0]["id"]
+
+    def test_overrides_are_persisted_and_returned(
+        self, client: TestClient, clip_id: str
+    ) -> None:
+        response = client.patch(
+            f"/api/clips/{clip_id}/captions",
+            json={
+                "style_overrides": {
+                    "font": "Inter",
+                    "size_ratio": 0.08,
+                    "primary": "#112233",
+                    "max_words": 2,
+                    "animation": "none",
+                }
+            },
+        )
+
+        assert response.status_code == 200
+        overrides = response.json()["style_overrides"]
+        assert overrides["font"] == "Inter"
+        assert overrides["primary"] == "#112233"
+        assert overrides["max_words"] == 2
+
+    def test_a_partial_patch_leaves_other_overrides_alone(
+        self, client: TestClient, clip_id: str
+    ) -> None:
+        client.patch(
+            f"/api/clips/{clip_id}/captions",
+            json={"style_overrides": {"font": "Inter", "max_words": 2}},
+        )
+
+        response = client.patch(
+            f"/api/clips/{clip_id}/captions", json={"caption_x_ratio": 0.2}
+        )
+
+        assert response.json()["style_overrides"] == {"font": "Inter", "max_words": 2}
+        assert response.json()["caption_x_ratio"] == pytest.approx(0.2)
+
+    def test_an_absent_key_leaves_the_stored_blob_unchanged(
+        self, client: TestClient, clip_id: str
+    ) -> None:
+        client.patch(
+            f"/api/clips/{clip_id}/captions",
+            json={"style_overrides": {"font": "Inter", "boxed": True}},
+        )
+
+        response = client.patch(f"/api/clips/{clip_id}/captions", json={"ratio": "1:1"})
+
+        assert response.json()["style_overrides"] == {"font": "Inter", "boxed": True}
+
+    def test_null_clears_the_stored_blob(self, client: TestClient, clip_id: str) -> None:
+        client.patch(
+            f"/api/clips/{clip_id}/captions", json={"style_overrides": {"font": "Inter"}}
+        )
+
+        response = client.patch(
+            f"/api/clips/{clip_id}/captions", json={"style_overrides": None}
+        )
+
+        assert response.json()["style_overrides"] is None
+
+    def test_an_empty_blob_is_the_same_as_clearing(self, client: TestClient, clip_id: str) -> None:
+        client.patch(
+            f"/api/clips/{clip_id}/captions", json={"style_overrides": {"font": "Inter"}}
+        )
+
+        response = client.patch(f"/api/clips/{clip_id}/captions", json={"style_overrides": {}})
+
+        assert response.json()["style_overrides"] is None
+
+    def test_null_clears_a_geometry_ratio_to_the_preset_default(
+        self, client: TestClient, clip_id: str
+    ) -> None:
+        client.patch(
+            f"/api/clips/{clip_id}/captions",
+            json={"caption_margin_ratio": 0.1, "caption_x_ratio": 0.2},
+        )
+
+        response = client.patch(
+            f"/api/clips/{clip_id}/captions",
+            json={"caption_margin_ratio": None, "caption_x_ratio": None},
+        )
+
+        assert response.json()["caption_margin_ratio"] is None
+        assert response.json()["caption_x_ratio"] is None
+
+    def test_an_unknown_font_is_a_400(self, client: TestClient, clip_id: str) -> None:
+        response = client.patch(
+            f"/api/clips/{clip_id}/captions",
+            json={"style_overrides": {"font": "Comic Sans MS"}},
+        )
+
+        assert response.status_code == 400
+        assert "Unknown font" in response.json()["detail"]
+
+    def test_out_of_range_numbers_are_clamped_not_rejected(
+        self, client: TestClient, clip_id: str
+    ) -> None:
+        # Contract §8.4: every stored value is clamped. A stale client must be
+        # corrected, never wedged out of the editor with a 422.
+        response = client.patch(
+            f"/api/clips/{clip_id}/captions",
+            json={
+                "style_overrides": {
+                    "size_ratio": 0.9,
+                    "max_words": 99,
+                    "outline_width": -3,
+                    "box_alpha": 900,
+                },
+                "caption_x_ratio": 5.0,
+                "caption_margin_ratio": -1.0,
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["style_overrides"]["size_ratio"] == pytest.approx(0.12)
+        assert body["style_overrides"]["max_words"] == 8
+        assert body["style_overrides"]["outline_width"] == pytest.approx(0.0)
+        assert body["style_overrides"]["box_alpha"] == 255
+        assert body["caption_x_ratio"] == pytest.approx(1.0)
+        assert body["caption_margin_ratio"] == pytest.approx(0.0)
+
+    def test_effective_caption_carries_the_overrides(
+        self, client: TestClient, clip_id: str
+    ) -> None:
+        client.patch(
+            f"/api/clips/{clip_id}/captions",
+            json={
+                "style_overrides": {
+                    "font": "Inter",
+                    "primary": "#112233",
+                    "accent": None,
+                    "max_words": 1,
+                }
+            },
+        )
+
+        effective = client.get(f"/api/clips/{clip_id}").json()["effective_caption"]
+
+        assert effective["font"] == "Inter"
+        assert effective["primary"] == "#112233"
+        # An explicit null disables per-word highlighting rather than restoring
+        # the preset's accent.
+        assert effective["accent"] is None
+        assert effective["maxWords"] == 1
+
+    def test_effective_caption_reports_horizontal_alignment(
+        self, client: TestClient, clip_id: str
+    ) -> None:
+        for x_ratio, expected in ((0.2, "left"), (0.8, "right"), (0.5, "center")):
+            client.patch(
+                f"/api/clips/{clip_id}/captions", json={"caption_x_ratio": x_ratio}
+            )
+
+            effective = client.get(f"/api/clips/{clip_id}").json()["effective_caption"]
+
+            assert effective["alignment"] == expected
+
+    def test_a_clip_without_overrides_matches_the_preset_preview(
+        self, client: TestClient, clip_id: str
+    ) -> None:
+        # Contract §8.1: the clip snapshot and the style catalogue are the same
+        # resolution, so an untouched clip must agree with the preset exactly.
+        preview = next(
+            s for s in client.get("/api/caption-styles").json() if s["key"] == "bold_pop"
+        )["preview"]
+
+        effective = client.get(f"/api/clips/{clip_id}").json()["effective_caption"]
+
+        assert effective == preview
+
+    def test_effective_caption_tracks_the_global_knobs(
+        self, client: TestClient, clip_id: str
+    ) -> None:
+        baseline = client.get(f"/api/clips/{clip_id}").json()["effective_caption"]
+        client.put("/api/settings", json={"export": {"caption_size_scale": 1.5}})
+
+        scaled = client.get(f"/api/clips/{clip_id}").json()["effective_caption"]
+
+        assert scaled["sizeRatio"] > baseline["sizeRatio"]
 
 
 class TestProviderStatus:

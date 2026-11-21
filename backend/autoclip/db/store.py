@@ -331,9 +331,10 @@ def upsert_clip_edit(edit: ClipEdit) -> ClipEdit:
             """
             INSERT INTO clip_edits (
                 clip_id, edited_words_json, caption_style, ratio,
-                crop_nudge, centre_crop, pip_enabled, pip_corner, pip_size, updated_at
+                crop_nudge, centre_crop, pip_enabled, pip_corner, pip_size,
+                style_overrides_json, caption_margin_ratio, caption_x_ratio, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(clip_id) DO UPDATE SET
                 edited_words_json = excluded.edited_words_json,
                 caption_style = excluded.caption_style,
@@ -343,6 +344,9 @@ def upsert_clip_edit(edit: ClipEdit) -> ClipEdit:
                 pip_enabled = excluded.pip_enabled,
                 pip_corner = excluded.pip_corner,
                 pip_size = excluded.pip_size,
+                style_overrides_json = excluded.style_overrides_json,
+                caption_margin_ratio = excluded.caption_margin_ratio,
+                caption_x_ratio = excluded.caption_x_ratio,
                 updated_at = excluded.updated_at
             """,
             (
@@ -355,6 +359,9 @@ def upsert_clip_edit(edit: ClipEdit) -> ClipEdit:
                 int(edit.pip_enabled),
                 edit.pip_corner,
                 edit.pip_size,
+                json.dumps(edit.style_overrides) if edit.style_overrides is not None else None,
+                edit.caption_margin_ratio,
+                edit.caption_x_ratio,
                 utcnow(),
             ),
         )

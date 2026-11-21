@@ -290,6 +290,88 @@ class TestTranscriptsEditsAndExports:
         assert reloaded.crop_nudge == pytest.approx(0.5)
         assert reloaded.centre_crop is True
 
+    def test_clip_edit_round_trips_style_overrides(self, job: Job) -> None:
+        clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
+        store.replace_clips(job.id, [clip])
+        overrides = {"font": "Anton", "size_ratio": 0.08, "accent": None, "max_words": 2}
+
+        store.upsert_clip_edit(ClipEdit(clip_id=clip.id, style_overrides=overrides))
+
+        loaded = store.get_clip_edit(clip.id)
+        assert loaded is not None
+        assert loaded.style_overrides == overrides
+
+    def test_clip_edit_round_trips_caption_geometry(self, job: Job) -> None:
+        clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
+        store.replace_clips(job.id, [clip])
+
+        store.upsert_clip_edit(
+            ClipEdit(clip_id=clip.id, caption_margin_ratio=0.12, caption_x_ratio=0.2)
+        )
+
+        loaded = store.get_clip_edit(clip.id)
+        assert loaded is not None
+        assert loaded.caption_margin_ratio == pytest.approx(0.12)
+        assert loaded.caption_x_ratio == pytest.approx(0.2)
+
+    def test_an_edit_without_styling_reads_back_as_null(self, job: Job) -> None:
+        clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
+        store.replace_clips(job.id, [clip])
+
+        store.upsert_clip_edit(ClipEdit(clip_id=clip.id))
+
+        loaded = store.get_clip_edit(clip.id)
+        assert loaded is not None
+        # Null, not an empty blob: there is one representation of "no overrides",
+        # and the resolver treats both the same way.
+        assert loaded.style_overrides is None
+        assert loaded.caption_margin_ratio is None
+        assert loaded.caption_x_ratio is None
+
+    def test_clearing_styling_persists_the_clear(self, job: Job) -> None:
+        clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
+        store.replace_clips(job.id, [clip])
+        store.upsert_clip_edit(
+            ClipEdit(
+                clip_id=clip.id,
+                style_overrides={"font": "Anton"},
+                caption_x_ratio=0.3,
+            )
+        )
+
+        store.upsert_clip_edit(
+            ClipEdit(clip_id=clip.id, style_overrides=None, caption_x_ratio=None)
+        )
+
+        loaded = store.get_clip_edit(clip.id)
+        assert loaded is not None
+        assert loaded.style_overrides is None
+        assert loaded.caption_x_ratio is None
+
+    def test_a_pre_styling_row_still_loads(self, job: Job) -> None:
+        # Contract §8.2: the reviewer's existing job — written before these
+        # columns existed — must load and re-export unchanged.
+        clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
+        store.replace_clips(job.id, [clip])
+        store.upsert_clip_edit(ClipEdit(clip_id=clip.id, caption_style="boxed"))
+
+        with db.connection() as conn:
+            conn.execute(
+                """
+                UPDATE clip_edits
+                   SET style_overrides_json = NULL,
+                       caption_margin_ratio = NULL,
+                       caption_x_ratio = NULL
+                 WHERE clip_id = ?
+                """,
+                (clip.id,),
+            )
+
+        loaded = store.get_clip_edit(clip.id)
+        assert loaded is not None
+        assert loaded.caption_style == "boxed"
+        assert loaded.style_overrides is None
+
     def test_clip_edit_round_trips_pip_settings(self, job: Job) -> None:
         clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
         store.replace_clips(job.id, [clip])

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
@@ -12,7 +13,7 @@ from fastapi.responses import FileResponse
 from .. import paths
 from ..config import load as load_settings
 from ..db import store
-from ..db.models import Export, new_id
+from ..db.models import ClipEdit, Export, new_id
 from ..pipeline import captions as captions_module
 from ..pipeline import export as export_module
 from ..pipeline.reframe.croppath import CropPath, centre_crop, shift_crop_path
@@ -35,10 +36,33 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["clips"])
 
 
-def _clip_out(clip) -> ClipOut:
+def _clip_out(clip, settings=None) -> ClipOut:
     edit = store.get_clip_edit(clip.id)
     exports = store.list_exports(clip.id)
-    return ClipOut.of(clip, edit=edit, exports=exports)
+    return ClipOut.of(
+        clip,
+        edit=edit,
+        exports=exports,
+        effective_caption=_effective_caption(edit, settings or load_settings()),
+    )
+
+
+def _effective_caption(edit: ClipEdit | None, settings) -> dict[str, Any]:
+    """The resolved caption snapshot for one clip (contract §1-§3).
+
+    Resolved by the same function, from the same inputs, that the exporter
+    calls. That shared call is the entire reason the review player can be
+    trusted: preview and burn-in cannot describe different captions.
+    """
+    style = captions_module.resolve_style(
+        edit.caption_style if edit else captions_module.DEFAULT_STYLE,
+        overrides=edit.style_overrides if edit else None,
+        size_scale=settings.export.caption_size_scale,
+        position_ratio=settings.export.caption_position_ratio,
+        caption_margin_ratio=edit.caption_margin_ratio if edit else None,
+        caption_x_ratio=edit.caption_x_ratio if edit else None,
+    )
+    return captions_module.preview_payload(style)
 
 
 async def list_clips_for_job(job_id: str) -> list[ClipOut]:
@@ -46,7 +70,9 @@ async def list_clips_for_job(job_id: str) -> list[ClipOut]:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     clips = await asyncio.to_thread(store.list_clips, job_id)
-    return [await asyncio.to_thread(_clip_out, clip) for clip in clips]
+    # One settings read for the whole page; resolution itself is pure.
+    settings = await asyncio.to_thread(load_settings)
+    return [await asyncio.to_thread(_clip_out, clip, settings) for clip in clips]
 
 
 @router.get("/clips/{clip_id}", response_model=ClipOut)
@@ -192,7 +218,14 @@ async def patch_clip(clip_id: str, payload: ClipPatchIn) -> ClipOut:
 
 @router.patch("/clips/{clip_id}/captions", response_model=ClipOut)
 async def patch_captions(clip_id: str, payload: CaptionPatchIn) -> ClipOut:
-    """Store word-level caption edits and style choices for a clip."""
+    """Store word-level caption edits, style choices, and caption geometry.
+
+    Style fields merge the way the framing corrections do: a present key wins
+    (an explicit null clears it), an absent key leaves the stored value alone.
+    ``model_fields_set`` is what makes that distinction available — pydantic
+    hands an omitted field its default, which is indistinguishable from a client
+    sending null unless we ask which keys actually arrived.
+    """
     clip = await asyncio.to_thread(store.get_clip, clip_id)
     if clip is None:
         raise HTTPException(status_code=404, detail="Clip not found.")
@@ -203,8 +236,14 @@ async def patch_captions(clip_id: str, payload: CaptionPatchIn) -> ClipOut:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    if payload.style_overrides is not None and payload.style_overrides.font is not None:
+        try:
+            captions_module.get_font(payload.style_overrides.font)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     existing = await asyncio.to_thread(store.get_clip_edit, clip_id)
-    from ..db.models import ClipEdit
+    supplied = payload.model_fields_set
 
     edit = ClipEdit(
         clip_id=clip_id,
@@ -235,6 +274,13 @@ async def patch_captions(clip_id: str, payload: CaptionPatchIn) -> ClipOut:
             payload.pip_size
             if payload.pip_size is not None
             else (existing.pip_size if existing else 0.35)
+        ),
+        style_overrides=_merged_overrides(payload, existing, supplied),
+        caption_margin_ratio=_merged_ratio(
+            payload, existing, supplied, "caption_margin_ratio", captions_module.MARGIN_RATIO_RANGE
+        ),
+        caption_x_ratio=_merged_ratio(
+            payload, existing, supplied, "caption_x_ratio", captions_module.X_RATIO_RANGE
         ),
     )
     await asyncio.to_thread(store.upsert_clip_edit, edit)
@@ -371,43 +417,63 @@ async def job_media(job_id: str) -> FileResponse:
 async def caption_styles() -> list[CaptionStyleOut]:
     """Style presets, with enough detail for the UI to approximate them in CSS.
 
-    The preview carries the user's size/position overrides, so what the review
-    player draws matches what the renderer burns in.
+    The preview carries the user's global size/position overrides, so what the
+    review player draws matches what the renderer burns in. Per-clip styling is
+    carried by ``ClipOut.effective_caption``, which resolves through the same
+    function.
     """
     settings = load_settings()
-    out = []
-    for style in captions_module.PRESETS.values():
-        effective = captions_module.resolve_style(
-            style.key,
-            size_scale=settings.export.caption_size_scale,
-            position_ratio=settings.export.caption_position_ratio,
+    return [
+        CaptionStyleOut(
+            key=style.key,
+            label=style.label,
+            description=style.description,
+            preview=captions_module.preview_payload(
+                captions_module.resolve_style(
+                    style.key,
+                    size_scale=settings.export.caption_size_scale,
+                    position_ratio=settings.export.caption_position_ratio,
+                )
+            ),
         )
-        out.append(
-            CaptionStyleOut(
-                key=style.key,
-                label=style.label,
-                description=style.description,
-                preview={
-                    "font": style.font,
-                    "primary": style.primary,
-                    "accent": style.accent,
-                    "outline": style.outline,
-                    "outlineWidth": style.outline_width,
-                    "allCaps": style.all_caps,
-                    "sizeRatio": effective.size_ratio,
-                    "marginRatio": effective.margin_v_ratio,
-                    "boxed": style.boxed,
-                    "animation": style.animation,
-                    "maxWords": style.max_words,
-                },
-            )
-        )
-    return out
+        for style in captions_module.PRESETS.values()
+    ]
 
 
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+
+def _merged_overrides(
+    payload: CaptionPatchIn, existing: ClipEdit | None, supplied: set[str]
+) -> dict[str, Any] | None:
+    """Merge the style blob: present replaces wholesale, null clears, absent keeps."""
+    if "style_overrides" not in supplied:
+        return existing.style_overrides if existing else None
+    if payload.style_overrides is None:
+        return None
+
+    # Only the keys the client actually sent, after clamping. An empty result is
+    # stored as NULL: "no overrides" gets one representation, not two.
+    clamped = captions_module.clamp_overrides(
+        payload.style_overrides.model_dump(exclude_unset=True)
+    )
+    return clamped or None
+
+
+def _merged_ratio(
+    payload: CaptionPatchIn,
+    existing: ClipEdit | None,
+    supplied: set[str],
+    name: str,
+    bounds: tuple[float, float],
+) -> float | None:
+    """Merge one geometry ratio, clamping rather than rejecting (contract §8.4)."""
+    if name not in supplied:
+        return getattr(existing, name) if existing else None
+    value = getattr(payload, name)
+    return None if value is None else captions_module.clamp(value, bounds)
 
 
 def _export_destination(clip, ratio: str) -> Path:

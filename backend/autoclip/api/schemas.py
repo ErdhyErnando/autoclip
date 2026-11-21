@@ -10,9 +10,10 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..db import models
+from ..pipeline.captions import COLOUR_PATTERN
 
 
 class SourceOut(BaseModel):
@@ -136,6 +137,36 @@ class ExportOut(BaseModel):
         )
 
 
+class StyleOverrides(BaseModel):
+    """Per-clip caption styling, layered over the base preset (contract §1).
+
+    Every field is optional and a missing field falls through to the layer
+    below. Numeric inputs carry no range constraint here on purpose: the
+    contract says clamp them, so out-of-range values are pulled into range by
+    ``captions.clamp_overrides`` rather than rejected.
+
+    ``extra="forbid"`` is the one strictness that pays for itself — a typo'd
+    field name would otherwise be dropped silently and the user would see no
+    change from a setting the UI said it saved.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    font: str | None = None
+    size_ratio: float | None = None
+    primary: str | None = Field(default=None, pattern=COLOUR_PATTERN)
+    #: None disables per-word highlighting; an absent key keeps the preset's.
+    accent: str | None = Field(default=None, pattern=COLOUR_PATTERN)
+    outline: str | None = Field(default=None, pattern=COLOUR_PATTERN)
+    outline_width: float | None = None
+    all_caps: bool | None = None
+    animation: Literal["scale", "karaoke", "none"] | None = None
+    max_words: int | None = None
+    boxed: bool | None = None
+    box_colour: str | None = Field(default=None, pattern=COLOUR_PATTERN)
+    box_alpha: int | None = None
+
+
 class ClipOut(BaseModel):
     id: str
     job_id: str
@@ -158,6 +189,14 @@ class ClipOut(BaseModel):
     pip_enabled: bool = False
     pip_corner: str = "auto"
     pip_size: float = 0.35
+    #: A plain dict on the way out so a blob written by a newer build still
+    #: serialises; ``StyleOverrides`` is the input model, which is where
+    #: strictness belongs. The JSON shape is identical either way.
+    style_overrides: dict[str, Any] | None = None
+    caption_margin_ratio: float | None = None
+    caption_x_ratio: float | None = None
+    #: The resolved caption snapshot — the same resolution the exporter burns.
+    effective_caption: dict[str, Any] | None = None
     exports: list[ExportOut] = Field(default_factory=list)
 
     @classmethod
@@ -167,6 +206,7 @@ class ClipOut(BaseModel):
         *,
         edit: models.ClipEdit | None = None,
         exports: list[models.Export] | None = None,
+        effective_caption: dict[str, Any] | None = None,
     ) -> ClipOut:
         return cls(
             id=clip.id,
@@ -190,6 +230,10 @@ class ClipOut(BaseModel):
             pip_enabled=edit.pip_enabled if edit else False,
             pip_corner=edit.pip_corner if edit else "auto",
             pip_size=edit.pip_size if edit else 0.35,
+            style_overrides=edit.style_overrides if edit else None,
+            caption_margin_ratio=edit.caption_margin_ratio if edit else None,
+            caption_x_ratio=edit.caption_x_ratio if edit else None,
+            effective_caption=effective_caption,
             exports=[ExportOut.of(e) for e in (exports or [])],
         )
 
@@ -213,6 +257,14 @@ class CaptionPatchIn(BaseModel):
     pip_enabled: bool | None = None
     pip_corner: Literal["auto", "tl", "tr", "bl", "br"] | None = None
     pip_size: float | None = Field(default=None, ge=0.2, le=0.6)
+    #: Per-clip style. Key present ⇒ replaces the stored blob wholesale; value
+    #: null ⇒ clears it; key absent ⇒ unchanged (contract §3).
+    style_overrides: StyleOverrides | None = None
+    #: Clamped, not rejected, so a stale client can't wedge the editor
+    #: (contract §8.4). Present ⇒ set, explicit null ⇒ back to the default,
+    #: absent ⇒ unchanged.
+    caption_margin_ratio: float | None = None
+    caption_x_ratio: float | None = None
 
 
 class ExportRequestIn(BaseModel):

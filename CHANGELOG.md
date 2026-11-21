@@ -10,6 +10,21 @@ lands here: per-clip caption styling, x-axis caption placement, more bundled
 fonts, and reusable presets. The interface both workstreams build against is
 [docs/promo-editor-contract.md](docs/promo-editor-contract.md).
 
+### Added
+
+- **Per-clip caption styling.** `clip_edits` gains a `style_overrides` blob
+  (font, colours, outline, size, all-caps, animation, and words-per-group) plus
+  `caption_margin_ratio` and `caption_x_ratio`, all nullable, so nothing needs a
+  data migration and a clip with no overrides resolves exactly as it did before.
+  `PATCH /api/clips/{id}/captions` merges the blob the way the framing
+  corrections already do: a key that is present replaces it wholesale, an
+  explicit `null` clears it, an absent key leaves it alone. Numbers are clamped;
+  an unknown font key is a 400.
+- **`ClipOut.effective_caption`** — the resolved caption snapshot for the clip,
+  produced by the same resolution the exporter burns. The review player draws it
+  directly instead of reimplementing the layering, which is what stops preview
+  and export from drifting apart.
+
 ### Fixed
 
 - **The review UI's export button could overwrite another clip's file.** Two
