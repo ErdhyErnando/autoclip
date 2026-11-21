@@ -409,10 +409,13 @@ def preview_payload(style: CaptionStyle) -> dict[str, Any]:
         "sizeRatio": style.size_ratio,
         "marginRatio": style.margin_v_ratio,
         "boxed": style.boxed,
+        "boxColour": style.box_colour,
+        "boxAlpha": style.box_alpha,
         "animation": style.animation,
         "maxWords": style.max_words,
         "alignment": style.alignment,
         "margin_ratio": style.margin_v_ratio,
+        "xRatio": style.x_ratio,
     }
 
 
@@ -480,6 +483,41 @@ def group_words(
 
 STYLE_NAME = "AutoClip"
 
+#: The horizontal inset every caption carried before x-axis placement existed,
+#: as a fraction of frame *height* — libass measures these margins in PlayRes
+#: units but the legacy value was derived from height. Kept verbatim so a clip
+#: with no x-axis override emits byte-identical ASS to the pre-styling renderer
+#: (contract §8.3).
+DEFAULT_HORIZONTAL_INSET = 0.03
+
+#: ASS alignment per horizontal anchor.
+ALIGNMENTS: dict[str, pysubs2.Alignment] = {
+    "left": pysubs2.Alignment.BOTTOM_LEFT,
+    "center": pysubs2.Alignment.BOTTOM_CENTER,
+    "right": pysubs2.Alignment.BOTTOM_RIGHT,
+}
+
+
+def horizontal_margins(style: CaptionStyle, *, width: int, height: int) -> tuple[int, int]:
+    """``(MarginL, MarginR)`` in PlayRes units — contract §2.
+
+    The caption is anchored by its **edge**, not its centre, so the margin on the
+    anchor side is simply how far that edge sits from the frame edge. The CSS
+    mirror draws the same thing with ``text-align`` plus an inset of the same
+    fraction, which is what keeps preview and burn-in from disagreeing.
+
+    Centred is the pre-styling behaviour right down to the odd height-derived
+    inset, and stays that way on purpose: no-override output must not shift.
+    """
+    inset = round(height * DEFAULT_HORIZONTAL_INSET)
+    if style.x_ratio is None:
+        return inset, inset
+    if style.alignment == "left":
+        return round(style.x_ratio * width), inset
+    if style.alignment == "right":
+        return inset, round((1.0 - style.x_ratio) * width)
+    return inset, inset
+
 
 def build_ass(
     words: list[Word],
@@ -504,7 +542,7 @@ def build_ass(
     subs.info["WrapStyle"] = "0"
 
     scale = height / REFERENCE_HEIGHT
-    subs.styles[STYLE_NAME] = _build_ass_style(style, height=height, scale=scale)
+    subs.styles[STYLE_NAME] = _build_ass_style(style, width=width, height=height, scale=scale)
 
     groups = group_words(words, max_words=style.max_words)
 
@@ -519,7 +557,9 @@ def build_ass(
     return subs
 
 
-def _build_ass_style(style: CaptionStyle, *, height: int, scale: float) -> pysubs2.SSAStyle:
+def _build_ass_style(
+    style: CaptionStyle, *, width: int, height: int, scale: float
+) -> pysubs2.SSAStyle:
     ass_style = pysubs2.SSAStyle()
     ass_style.fontname = style.font
     ass_style.fontsize = round(height * style.size_ratio)
@@ -532,9 +572,9 @@ def _build_ass_style(style: CaptionStyle, *, height: int, scale: float) -> pysub
     ass_style.shadow = style.shadow * scale
     # BorderStyle 3 draws an opaque box using backcolor instead of an outline.
     ass_style.borderstyle = 3 if style.boxed else 1
-    ass_style.alignment = pysubs2.Alignment.BOTTOM_CENTER
+    ass_style.alignment = ALIGNMENTS[style.alignment]
     ass_style.marginv = round(height * style.margin_v_ratio)
-    ass_style.marginl = ass_style.marginr = round(height * 0.03)
+    ass_style.marginl, ass_style.marginr = horizontal_margins(style, width=width, height=height)
     return ass_style
 
 

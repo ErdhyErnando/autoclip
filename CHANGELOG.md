@@ -24,6 +24,16 @@ fonts, and reusable presets. The interface both workstreams build against is
   produced by the same resolution the exporter burns. The review player draws it
   directly instead of reimplementing the layering, which is what stops preview
   and export from drifting apart.
+- **Horizontal caption placement.** A clip's `caption_x_ratio` anchors its
+  caption block to the left or right edge — `BOTTOM_LEFT`/`BOTTOM_RIGHT` with
+  `MarginL`/`MarginR` in PlayRes units — where the alignment used to be
+  hardcoded to `BOTTOM_CENTER`. The block is anchored by its edge on both sides,
+  so the CSS the preview draws and the ASS libass burns describe the same
+  geometry. Positions within 4% of centre snap to centred. The `caption-styles`
+  preview payload now carries alignment, position, and box colours so the CSS
+  approximation can follow per-clip overrides.
+- **Words per screen.** A clip's `max_words` (1–8) now reaches `group_words`, so
+  one word per group — the snappy look — is finally reachable from the editor.
 
 ### Fixed
 

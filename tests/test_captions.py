@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pysubs2
 import pytest
 from autoclip.pipeline import captions
@@ -256,3 +258,297 @@ class TestResolveStyle:
         assert captions.resolve_style("boxed", position_ratio=-0.5).margin_v_ratio == pytest.approx(
             0.0
         )
+
+
+class TestNoOverrideRegression:
+    """Contract §8.3: no overrides must burn byte-identical to the old renderer.
+
+    The fixtures under ``data/ass_main`` were generated from ``main`` at 3f66b38
+    — the commit this work branched from — so this is a diff against the real
+    previous output, not against a reimplementation of it.
+    """
+
+    WORDS = ["the", "quick", "brown", "fox", "jumps", "over."]
+
+    @staticmethod
+    def _words() -> list[Word]:
+        return [
+            Word(text=text, start=index * 0.4, end=index * 0.4 + 0.32)
+            for index, text in enumerate(TestNoOverrideRegression.WORDS)
+        ]
+
+    @pytest.mark.parametrize("key", list(captions.PRESETS))
+    def test_every_preset_matches_the_pre_styling_output(self, key: str) -> None:
+        expected = (Path(__file__).parent / "data" / "ass_main" / f"{key}.ass").read_text(
+            encoding="utf-8"
+        )
+
+        subs = captions.build_ass(self._words(), captions.get_style(key), width=1080, height=1920)
+
+        assert subs.to_string(format_="ass") == expected
+
+    def test_resolving_with_no_overrides_returns_the_preset_itself(self) -> None:
+        # Identity, not equality: nothing to layer means nothing is rebuilt, which
+        # is why the bytes cannot move.
+        assert captions.resolve_style("boxed") is captions.PRESETS["boxed"]
+
+
+class TestOverrideResolution:
+    def test_font_override_reaches_the_ass_style(self) -> None:
+        style = captions.resolve_style("bold_pop", overrides={"font": "Inter"})
+
+        assert style.font == "Inter"
+        assert style.font_path.name == "Inter-Variable.ttf"
+
+    def test_colour_overrides_replace_the_preset_values(self) -> None:
+        style = captions.resolve_style(
+            "bold_pop",
+            overrides={"primary": "#112233", "accent": "#445566", "outline": "#778899"},
+        )
+
+        assert style.primary == "#112233"
+        assert style.accent == "#445566"
+        assert style.outline == "#778899"
+
+    def test_a_null_accent_disables_per_word_highlighting(self) -> None:
+        style = captions.resolve_style("bold_pop", overrides={"accent": None})
+        events = captions.build_ass(
+            self._words(), style, width=1080, height=1920
+        ).events
+
+        assert style.accent is None
+        # Without an accent there is nothing to highlight, so one event per group
+        # instead of one per word.
+        assert len(events) == len(captions.group_words(self._words(), max_words=style.max_words))
+        assert not any("\\c&H" in event.text for event in events)
+
+    def test_an_absent_accent_keeps_the_preset_accent(self) -> None:
+        style = captions.resolve_style("bold_pop", overrides={"primary": "#112233"})
+
+        assert style.accent == captions.PRESETS["bold_pop"].accent
+
+    def test_size_ratio_replaces_rather_than_multiplies(self) -> None:
+        # The override is an absolute fraction of frame height, not a multiplier
+        # on the preset, so it must win outright over the global knob too.
+        style = captions.resolve_style(
+            "bold_pop", size_scale=2.0, overrides={"size_ratio": 0.03}
+        )
+
+        assert style.size_ratio == pytest.approx(0.03)
+
+    @pytest.mark.parametrize("mode", captions.ANIMATIONS)
+    def test_animation_override_is_honoured(self, mode: str) -> None:
+        style = captions.resolve_style("bold_pop", overrides={"animation": mode})
+
+        assert style.animation == mode
+
+    def test_all_caps_and_boxed_overrides_apply(self) -> None:
+        style = captions.resolve_style(
+            "clean_lower", overrides={"all_caps": True, "boxed": True}
+        )
+        subs = captions.build_ass(self._words(), style, width=1080, height=1920)
+
+        assert subs.styles[captions.STYLE_NAME].borderstyle == 3
+        assert "ONE" in " ".join(e.text for e in subs.events)
+
+    def test_box_colour_and_alpha_reach_the_style(self) -> None:
+        style = captions.resolve_style(
+            "boxed", overrides={"box_colour": "#102030", "box_alpha": 200}
+        )
+
+        assert style.box_colour == "#102030"
+        assert style.box_alpha == 200
+
+    def test_outline_width_override_applies(self) -> None:
+        style = captions.resolve_style("bold_pop", overrides={"outline_width": 7.0})
+
+        assert style.outline_width == pytest.approx(7.0)
+
+    @staticmethod
+    def _words() -> list[Word]:
+        return evenly_spaced(["one", "two", "three", "four", "five"])
+
+
+class TestWordsPerScreen:
+    """The pacing knob: the override's max_words feeds grouping (contract §1)."""
+
+    @pytest.mark.parametrize("max_words", range(1, 9))
+    def test_each_setting_caps_the_group_size(self, max_words: int) -> None:
+        words = evenly_spaced([f"w{i}" for i in range(16)])
+
+        style = captions.resolve_style("bold_pop", overrides={"max_words": max_words})
+        groups = captions.group_words(words, max_words=style.max_words)
+
+        assert all(len(g.words) <= max_words for g in groups)
+        assert style.max_words == max_words
+
+    def test_one_word_per_group_is_the_snappy_look(self) -> None:
+        words = evenly_spaced([f"w{i}" for i in range(6)])
+
+        style = captions.resolve_style("bold_pop", overrides={"max_words": 1})
+        groups = captions.group_words(words, max_words=style.max_words)
+
+        assert [len(g.words) for g in groups] == [1] * 6
+
+    def test_out_of_range_pacing_is_clamped_not_raised(self) -> None:
+        assert captions.resolve_style("bold_pop", overrides={"max_words": 99}).max_words == 8
+        assert captions.resolve_style("bold_pop", overrides={"max_words": 0}).max_words == 1
+        assert captions.resolve_style("bold_pop", overrides={"max_words": -4}).max_words == 1
+
+
+class TestHorizontalAlignment:
+    """Contract §2: the block is anchored by its edge, on both sides."""
+
+    WIDTH = 1080
+    HEIGHT = 1920
+    #: The inset every caption carried before x-axis placement.
+    LEGACY_INSET = round(HEIGHT * 0.03)
+
+    def _margins(self, x_ratio):
+        style = captions.resolve_style("bold_pop", caption_x_ratio=x_ratio)
+        return captions.horizontal_margins(style, width=self.WIDTH, height=self.HEIGHT)
+
+    def test_centred_is_the_legacy_geometry(self) -> None:
+        assert self._margins(None) == (self.LEGACY_INSET, self.LEGACY_INSET)
+
+    def test_left_of_centre_anchors_the_left_margin(self) -> None:
+        assert self._margins(0.25) == (round(0.25 * self.WIDTH), self.LEGACY_INSET)
+
+    def test_right_of_centre_anchors_the_right_margin(self) -> None:
+        assert self._margins(0.75) == (self.LEGACY_INSET, round(0.25 * self.WIDTH))
+
+    def test_alignment_follows_the_side(self) -> None:
+        assert captions.resolve_style("bold_pop", caption_x_ratio=0.2).alignment == "left"
+        assert captions.resolve_style("bold_pop", caption_x_ratio=0.8).alignment == "right"
+        assert captions.resolve_style("bold_pop", caption_x_ratio=None).alignment == "center"
+
+    def test_near_centre_snaps_to_centred(self) -> None:
+        # A drag that lands "centred enough" renders centred rather than
+        # left-aligned against a margin thinner than the outline.
+        for x_ratio in (0.5, 0.47, 0.53, 0.5 - captions.X_SNAP_TOLERANCE):
+            style = captions.resolve_style("bold_pop", caption_x_ratio=x_ratio)
+
+            assert style.x_ratio is None, x_ratio
+            assert style.alignment == "center"
+
+    def test_just_past_the_snap_tolerance_stays_anchored(self) -> None:
+        x_ratio = 0.5 - captions.X_SNAP_TOLERANCE - 0.01
+
+        style = captions.resolve_style("bold_pop", caption_x_ratio=x_ratio)
+
+        assert style.alignment == "left"
+        assert style.x_ratio == pytest.approx(x_ratio)
+
+    def test_out_of_range_positions_are_clamped(self) -> None:
+        assert captions.resolve_style("bold_pop", caption_x_ratio=4.0).x_ratio == 1.0
+        assert captions.resolve_style("bold_pop", caption_x_ratio=-4.0).x_ratio == 0.0
+
+    def test_ass_style_carries_the_alignment_and_margins(self) -> None:
+        style = captions.resolve_style("bold_pop", caption_x_ratio=0.25)
+
+        subs = captions.build_ass(
+            evenly_spaced(["hello"]), style, width=self.WIDTH, height=self.HEIGHT
+        )
+        emitted = subs.styles[captions.STYLE_NAME]
+
+        assert emitted.alignment == pysubs2.Alignment.BOTTOM_LEFT
+        assert emitted.marginl == round(0.25 * self.WIDTH)
+        assert emitted.marginr == self.LEGACY_INSET
+
+    def test_right_alignment_reaches_the_ass_style(self) -> None:
+        style = captions.resolve_style("bold_pop", caption_x_ratio=0.8)
+
+        subs = captions.build_ass(
+            evenly_spaced(["hello"]), style, width=self.WIDTH, height=self.HEIGHT
+        )
+        emitted = subs.styles[captions.STYLE_NAME]
+
+        assert emitted.alignment == pysubs2.Alignment.BOTTOM_RIGHT
+        assert emitted.marginr == round(0.2 * self.WIDTH)
+
+    def test_vertical_margin_is_clamped(self) -> None:
+        assert captions.resolve_style(
+            "bold_pop", caption_margin_ratio=5.0
+        ).margin_v_ratio == pytest.approx(0.8)
+        assert captions.resolve_style(
+            "bold_pop", caption_margin_ratio=-1.0
+        ).margin_v_ratio == pytest.approx(0.0)
+
+
+class TestLayering:
+    """Contract §1: overrides > per-clip geometry > legacy globals > preset."""
+
+    def test_a_per_clip_margin_beats_the_global_knob(self) -> None:
+        style = captions.resolve_style(
+            "bold_pop", position_ratio=0.30, caption_margin_ratio=0.10
+        )
+
+        assert style.margin_v_ratio == pytest.approx(0.10)
+
+    def test_without_a_per_clip_margin_the_global_knob_still_wins(self) -> None:
+        # The transition layer has to keep working, or an existing user's
+        # captions move when they open the new editor (contract §8.3).
+        style = captions.resolve_style("bold_pop", position_ratio=0.30)
+
+        assert style.margin_v_ratio == pytest.approx(0.30)
+
+    def test_without_any_override_the_preset_value_stands(self) -> None:
+        style = captions.resolve_style("bold_pop")
+
+        assert style.margin_v_ratio == captions.PRESETS["bold_pop"].margin_v_ratio
+
+    def test_a_stale_blob_never_raises(self) -> None:
+        # Resolution must survive whatever is in the database, including a blob
+        # written by a build that knew things this one doesn't.
+        style = captions.resolve_style(
+            "bold_pop",
+            overrides={
+                "font": "Comic Sans MS",
+                "primary": "not-a-colour",
+                "animation": "explode",
+                "max_words": "lots",
+                "size_ratio": None,
+                "wobble": 3,
+            },
+        )
+
+        assert style.font == "Anton"
+        assert style.primary == captions.PRESETS["bold_pop"].primary
+        assert style.animation == captions.PRESETS["bold_pop"].animation
+        assert style.max_words == captions.PRESETS["bold_pop"].max_words
+
+    def test_clamped_overrides_are_idempotent(self) -> None:
+        once = captions.clamp_overrides({"size_ratio": 9.0, "max_words": 99})
+
+        assert captions.clamp_overrides(once) == once
+        assert once == {"size_ratio": 0.12, "max_words": 8}
+
+
+class TestPreviewPayload:
+    """Contract §8.1: the payload and the burned style come from one resolution."""
+
+    def test_carries_the_alignment_and_geometry(self) -> None:
+        style = captions.resolve_style("bold_pop", caption_x_ratio=0.2)
+
+        payload = captions.preview_payload(style)
+
+        assert payload["alignment"] == "left"
+        assert payload["xRatio"] == pytest.approx(0.2)
+        assert payload["margin_ratio"] == pytest.approx(style.margin_v_ratio)
+
+    def test_carries_the_box_style_the_css_needs(self) -> None:
+        payload = captions.preview_payload(captions.get_style("boxed"))
+
+        assert payload["boxColour"] == "#000000"
+        assert payload["boxAlpha"] == captions.PRESETS["boxed"].box_alpha
+
+    def test_reflects_overrides(self) -> None:
+        style = captions.resolve_style(
+            "bold_pop", overrides={"font": "Inter", "max_words": 2, "outline_width": 1.0}
+        )
+
+        payload = captions.preview_payload(style)
+
+        assert payload["font"] == "Inter"
+        assert payload["maxWords"] == 2
+        assert payload["outlineWidth"] == pytest.approx(1.0)

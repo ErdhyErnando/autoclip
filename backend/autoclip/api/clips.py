@@ -356,6 +356,9 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
         style=style,
         ratio=payload.ratio,
         pip=pip,
+        style_overrides=stored_edit.style_overrides if stored_edit else None,
+        caption_margin_ratio=stored_edit.caption_margin_ratio if stored_edit else None,
+        caption_x_ratio=stored_edit.caption_x_ratio if stored_edit else None,
     )
 
     try:
