@@ -123,12 +123,46 @@ def _migration_v3(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_v4(conn: sqlite3.Connection) -> None:
+    # Nullable and additive: a clip with no stored styling resolves exactly as it
+    # did before, so an existing job needs no data migration. ``style_overrides``
+    # keeps the ``_json`` suffix the neighbouring column uses.
+    conn.executescript(
+        """
+        ALTER TABLE clip_edits ADD COLUMN style_overrides_json TEXT;
+        ALTER TABLE clip_edits ADD COLUMN caption_margin_ratio REAL;
+        ALTER TABLE clip_edits ADD COLUMN caption_x_ratio REAL;
+        """
+    )
+
+
+def _migration_v5(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE presets (
+            id              TEXT PRIMARY KEY,
+            name            TEXT NOT NULL UNIQUE,
+            base_style      TEXT NOT NULL DEFAULT 'bold_pop',
+            style_overrides TEXT,
+            layout          TEXT,
+            is_default      INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL
+        );
+        -- At most one default, enforced where it cannot be forgotten: the
+        -- partial index makes a second one fail rather than silently win.
+        CREATE UNIQUE INDEX idx_presets_default ON presets(is_default) WHERE is_default = 1;
+        """
+    )
+
+
 #: Ordered migrations. Index + 1 is the resulting ``user_version``.
 #: Append only — never edit a migration that has shipped.
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _migration_v1,
     _migration_v2,
     _migration_v3,
+    _migration_v4,
+    _migration_v5,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)

@@ -13,6 +13,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from ..config import ExportSettings
 from ..system import report
@@ -73,6 +74,12 @@ class ExportRequest:
     ratio: str = "9:16"
     burn_captions: bool = True
     pip: PipLayout | None = None
+    #: The clip's own styling, layered over ``style`` at render time. Kept apart
+    #: from ``style`` rather than pre-merged because the legacy global knobs live
+    #: in settings, and that layer has to be applied in one place — here.
+    style_overrides: dict[str, Any] | None = None
+    caption_margin_ratio: float | None = None
+    caption_x_ratio: float | None = None
 
     @property
     def duration_s(self) -> float:
@@ -303,12 +310,17 @@ def export_clip(
     settings = settings or ExportSettings()
     out_w, out_h = ratio_dimensions(request.ratio)
 
-    # The request carries the preset; the user's size/position overrides live in
-    # settings so one change applies to pipeline exports and re-exports alike.
+    # The request carries the preset and the clip's own styling; the user's
+    # global knobs live in settings so one change applies to pipeline exports and
+    # re-exports alike. All of it resolves through the one function the API's
+    # ``effective_caption`` also calls, so preview and burn-in cannot drift.
     style = captions_module.resolve_style(
         request.style.key,
         size_scale=settings.caption_size_scale,
         position_ratio=settings.caption_position_ratio,
+        overrides=request.style_overrides,
+        caption_margin_ratio=request.caption_margin_ratio,
+        caption_x_ratio=request.caption_x_ratio,
     )
 
     # Each clip renders in its own workspace so concurrent exports can't collide

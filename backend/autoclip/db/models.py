@@ -182,6 +182,15 @@ class ClipEdit:
     pip_corner: str = "auto"
     #: Inset width as a fraction of output width.
     pip_size: float = 0.35
+    #: Per-clip caption styling, layered over the base preset. None means the
+    #: clip has no overrides and resolves to the preset alone.
+    style_overrides: dict[str, Any] | None = None
+    #: Distance of the captions from the bottom, as a fraction of frame height.
+    #: None falls through to the legacy global, then to the preset.
+    caption_margin_ratio: float | None = None
+    #: Horizontal caption anchor, 0 (left edge) to 1 (right edge). None means
+    #: horizontally centred, which is what every clip did before this existed.
+    caption_x_ratio: float | None = None
     updated_at: str = field(default_factory=utcnow)
 
     @classmethod
@@ -191,6 +200,8 @@ class ClipEdit:
 
         def _col(name: str, default):
             return row[name] if name in keys else default
+
+        raw_overrides = _col("style_overrides_json", None)
 
         return cls(
             clip_id=row["clip_id"],
@@ -202,7 +213,44 @@ class ClipEdit:
             pip_enabled=bool(_col("pip_enabled", 0)),
             pip_corner=_col("pip_corner", "auto"),
             pip_size=_col("pip_size", 0.35),
+            style_overrides=json.loads(raw_overrides) if raw_overrides else None,
+            caption_margin_ratio=_col("caption_margin_ratio", None),
+            caption_x_ratio=_col("caption_x_ratio", None),
             updated_at=row["updated_at"],
+        )
+
+
+@dataclass
+class Preset:
+    """A named, reusable caption look and layout (contract §4).
+
+    ``layout`` holds the on-screen geometry rather than the style blob, so Phase
+    2 can append the PiP placement fields to it without touching the style
+    schema. A preset is a *template*: applying it copies its values onto a clip,
+    which is why editing or deleting one never changes a clip that already has it.
+    """
+
+    id: str
+    name: str
+    base_style: str = "bold_pop"
+    style_overrides: dict[str, Any] | None = None
+    layout: dict[str, Any] | None = None
+    #: At most one row may be the default — enforced by a partial unique index.
+    is_default: bool = False
+    created_at: str = field(default_factory=utcnow)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> Preset:
+        raw_overrides = row["style_overrides"]
+        raw_layout = row["layout"]
+        return cls(
+            id=row["id"],
+            name=row["name"],
+            base_style=row["base_style"],
+            style_overrides=json.loads(raw_overrides) if raw_overrides else None,
+            layout=json.loads(raw_layout) if raw_layout else None,
+            is_default=bool(row["is_default"]),
+            created_at=row["created_at"],
         )
 
 

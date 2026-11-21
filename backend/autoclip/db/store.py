@@ -7,6 +7,7 @@ wrap them in ``asyncio.to_thread``.
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any
 
@@ -18,6 +19,7 @@ from .models import (
     Export,
     Job,
     JobStatus,
+    Preset,
     Source,
     Transcript,
     utcnow,
@@ -325,39 +327,50 @@ def update_clip(
 # --------------------------------------------------------------------------
 
 
+def _write_clip_edit(conn, edit: ClipEdit) -> None:
+    conn.execute(
+        """
+        INSERT INTO clip_edits (
+            clip_id, edited_words_json, caption_style, ratio,
+            crop_nudge, centre_crop, pip_enabled, pip_corner, pip_size,
+            style_overrides_json, caption_margin_ratio, caption_x_ratio, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(clip_id) DO UPDATE SET
+            edited_words_json = excluded.edited_words_json,
+            caption_style = excluded.caption_style,
+            ratio = excluded.ratio,
+            crop_nudge = excluded.crop_nudge,
+            centre_crop = excluded.centre_crop,
+            pip_enabled = excluded.pip_enabled,
+            pip_corner = excluded.pip_corner,
+            pip_size = excluded.pip_size,
+            style_overrides_json = excluded.style_overrides_json,
+            caption_margin_ratio = excluded.caption_margin_ratio,
+            caption_x_ratio = excluded.caption_x_ratio,
+            updated_at = excluded.updated_at
+        """,
+        (
+            edit.clip_id,
+            json.dumps(edit.edited_words) if edit.edited_words is not None else None,
+            edit.caption_style,
+            edit.ratio,
+            edit.crop_nudge,
+            int(edit.centre_crop),
+            int(edit.pip_enabled),
+            edit.pip_corner,
+            edit.pip_size,
+            json.dumps(edit.style_overrides) if edit.style_overrides is not None else None,
+            edit.caption_margin_ratio,
+            edit.caption_x_ratio,
+            utcnow(),
+        ),
+    )
+
+
 def upsert_clip_edit(edit: ClipEdit) -> ClipEdit:
     with connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO clip_edits (
-                clip_id, edited_words_json, caption_style, ratio,
-                crop_nudge, centre_crop, pip_enabled, pip_corner, pip_size, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(clip_id) DO UPDATE SET
-                edited_words_json = excluded.edited_words_json,
-                caption_style = excluded.caption_style,
-                ratio = excluded.ratio,
-                crop_nudge = excluded.crop_nudge,
-                centre_crop = excluded.centre_crop,
-                pip_enabled = excluded.pip_enabled,
-                pip_corner = excluded.pip_corner,
-                pip_size = excluded.pip_size,
-                updated_at = excluded.updated_at
-            """,
-            (
-                edit.clip_id,
-                json.dumps(edit.edited_words) if edit.edited_words is not None else None,
-                edit.caption_style,
-                edit.ratio,
-                edit.crop_nudge,
-                int(edit.centre_crop),
-                int(edit.pip_enabled),
-                edit.pip_corner,
-                edit.pip_size,
-                utcnow(),
-            ),
-        )
+        _write_clip_edit(conn, edit)
     return edit
 
 
@@ -404,3 +417,137 @@ def list_exports(clip_id: str) -> list[Export]:
             "SELECT * FROM exports WHERE clip_id = ? ORDER BY created_at DESC", (clip_id,)
         ).fetchall()
     return [Export.from_row(r) for r in rows]
+
+
+# --------------------------------------------------------------------------
+# Presets
+# --------------------------------------------------------------------------
+
+
+def create_preset(preset: Preset) -> Preset:
+    """Insert a preset. A duplicate name raises ``sqlite3.IntegrityError``.
+
+    The API turns that into a 409: names are how a person picks a preset, so two
+    rows sharing one would be a menu with two identical entries.
+    """
+    with connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO presets (id, name, base_style, style_overrides, layout,
+                                 is_default, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                preset.id,
+                preset.name,
+                preset.base_style,
+                json.dumps(preset.style_overrides) if preset.style_overrides else None,
+                json.dumps(preset.layout) if preset.layout else None,
+                int(preset.is_default),
+                preset.created_at,
+            ),
+        )
+    return preset
+
+
+def get_preset(preset_id: str) -> Preset | None:
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM presets WHERE id = ?", (preset_id,)).fetchone()
+    return Preset.from_row(row) if row else None
+
+
+def list_presets() -> list[Preset]:
+    """All presets, the default first — the order the picker shows them in."""
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM presets ORDER BY is_default DESC, created_at ASC, name ASC"
+        ).fetchall()
+    return [Preset.from_row(r) for r in rows]
+
+
+def update_preset(
+    preset_id: str,
+    *,
+    name: str | None = None,
+    base_style: str | None = None,
+    style_overrides: dict[str, Any] | None | _Unset = UNSET,
+    layout: dict[str, Any] | None | _Unset = UNSET,
+) -> None:
+    """Patch the supplied fields. Omitted fields are left untouched.
+
+    Nullable blobs take :data:`UNSET` as their default, so passing ``None``
+    explicitly clears them.
+    """
+    fields: dict[str, Any] = {}
+    for field_name, value in (("name", name), ("base_style", base_style)):
+        if value is not None:
+            fields[field_name] = value
+
+    for field_name, value in (("style_overrides", style_overrides), ("layout", layout)):
+        if not isinstance(value, _Unset):
+            fields[field_name] = json.dumps(value) if value else None
+
+    if not fields:
+        return
+
+    assignments = ", ".join(f"{field} = ?" for field in fields)
+    with connection() as conn:
+        conn.execute(
+            f"UPDATE presets SET {assignments} WHERE id = ?",
+            (*fields.values(), preset_id),
+        )
+
+
+def set_default_preset(preset_id: str) -> None:
+    """Mark one preset as the default and clear any other.
+
+    Clearing first is what the partial unique index requires; doing both in one
+    transaction means a reader never sees two defaults or none.
+    """
+    with connection() as conn:
+        conn.execute("UPDATE presets SET is_default = 0 WHERE is_default = 1")
+        conn.execute("UPDATE presets SET is_default = 1 WHERE id = ?", (preset_id,))
+
+
+def default_preset() -> Preset | None:
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM presets WHERE is_default = 1").fetchone()
+    return Preset.from_row(row) if row else None
+
+
+def delete_preset(preset_id: str) -> bool:
+    """Delete a preset. Returns False when there was nothing to delete.
+
+    Clips carry copies of what was applied, so this never changes a clip — even
+    when the deleted preset was the default.
+    """
+    with connection() as conn:
+        cursor = conn.execute("DELETE FROM presets WHERE id = ?", (preset_id,))
+    return cursor.rowcount > 0
+
+
+def apply_preset_to_clips(clip_ids: list[str], preset: Preset) -> None:
+    """Copy a preset's look and layout onto clips, in one transaction.
+
+    Only the style and geometry fields move; a clip keeps its words, its framing
+    corrections, and its PiP settings. The blob is deep-copied so the clip owns
+    its values outright — later edits to, or deletion of, the preset cannot reach
+    back into a clip that was already styled.
+    """
+    if not clip_ids:
+        return
+
+    layout = preset.layout or {}
+    with connection() as conn:
+        for clip_id in clip_ids:
+            row = conn.execute(
+                "SELECT * FROM clip_edits WHERE clip_id = ?", (clip_id,)
+            ).fetchone()
+            edit = ClipEdit.from_row(row) if row else ClipEdit(clip_id=clip_id)
+            edit.caption_style = preset.base_style
+            edit.style_overrides = (
+                copy.deepcopy(preset.style_overrides) if preset.style_overrides else None
+            )
+            edit.caption_margin_ratio = layout.get("caption_margin_ratio")
+            edit.caption_x_ratio = layout.get("caption_x_ratio")
+            _write_clip_edit(conn, edit)

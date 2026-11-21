@@ -5,8 +5,62 @@ versions follow [semantic versioning](https://semver.org/) once 0.1.0 ships.
 
 ## Unreleased
 
-Nothing yet. Validation work after the release lands here — the golden-set
-machinery is [docs/goldens.md](docs/goldens.md).
+The promo-editor epic ([#16](https://github.com/ErdhyErnando/autoclip/issues/16))
+lands here: per-clip caption styling, x-axis caption placement, more bundled
+fonts, and reusable presets. The interface both workstreams build against is
+[docs/promo-editor-contract.md](docs/promo-editor-contract.md).
+
+### Added
+
+- **Per-clip caption styling.** `clip_edits` gains a `style_overrides` blob
+  (font, colours, outline, size, all-caps, animation, and words-per-group) plus
+  `caption_margin_ratio` and `caption_x_ratio`, all nullable, so nothing needs a
+  data migration and a clip with no overrides resolves exactly as it did before.
+  `PATCH /api/clips/{id}/captions` merges the blob the way the framing
+  corrections already do: a key that is present replaces it wholesale, an
+  explicit `null` clears it, an absent key leaves it alone. Numbers are clamped;
+  an unknown font key is a 400.
+- **`ClipOut.effective_caption`** — the resolved caption snapshot for the clip,
+  produced by the same resolution the exporter burns. The review player draws it
+  directly instead of reimplementing the layering, which is what stops preview
+  and export from drifting apart.
+- **Horizontal caption placement.** A clip's `caption_x_ratio` anchors its
+  caption block to the left or right edge — `BOTTOM_LEFT`/`BOTTOM_RIGHT` with
+  `MarginL`/`MarginR` in PlayRes units — where the alignment used to be
+  hardcoded to `BOTTOM_CENTER`. The block is anchored by its edge on both sides,
+  so the CSS the preview draws and the ASS libass burns describe the same
+  geometry. Positions within 4% of centre snap to centred. The `caption-styles`
+  preview payload now carries alignment, position, and box colours so the CSS
+  approximation can follow per-clip overrides.
+- **Words per screen.** A clip's `max_words` (1–8) now reaches `group_words`, so
+  one word per group — the snappy look — is finally reachable from the editor.
+- **Three more caption fonts.** Archivo Black, Bebas Neue and Lilita One join
+  Anton and Inter in a font registry (`captions.FONTS`), exposed as
+  `GET /api/fonts` for the style editor's picker, and `CaptionStyle.font` is
+  validated against it — an unknown key is a 400 rather than a silent libass
+  substitution that would look nothing like the preview. All five faces are SIL
+  OFL, committed to the repo, and staged into the render workspace with the ASS
+  file, so nothing is fetched at runtime. Lilita One ships at 28 KB, smaller than
+  the other four; it was verified as a genuine TrueType file (magic bytes, family
+  name, name table) rather than by size alone.
+- **Reusable caption presets.** A `presets` table stores a named base style,
+  style-override blob, and layout, with at most one row marked as the default (a
+  partial unique index, so two defaults cannot exist even by accident). Full CRUD
+  under `/api/presets`, plus set-default and apply-to-clip. Applying copies the
+  values onto the clip's edit — so editing or deleting a preset never changes a
+  clip that already carries its look — and a default preset is applied where
+  clips are persisted after highlight detection, so a fresh job opens on-brand
+  with no client round-trip. With no presets configured, nothing changes: no clip
+  edits are written at all.
+
+### Fixed
+
+- **The review UI's export button could overwrite another clip's file.** Two
+  clips sharing a title — which an LLM is free to produce — wrote one filename,
+  so exporting B clobbered A's render while A's `Export` row kept pointing at
+  it. Batch export already appended the clip's rank (`a699ea6`); the endpoint
+  now disambiguates the same way, seeded from the job's persisted exports.
+  Re-exporting the same clip still overwrites itself, which is correct.
 
 ## 0.1.0 — 2026-11-20
 

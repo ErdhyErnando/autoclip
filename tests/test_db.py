@@ -7,7 +7,7 @@ import sqlite3
 import pytest
 from autoclip import db, paths
 from autoclip.db import store
-from autoclip.db.models import Clip, ClipEdit, Export, Job, Source, Transcript, new_id
+from autoclip.db.models import Clip, ClipEdit, Export, Job, Preset, Source, Transcript, new_id
 
 
 def test_init_creates_database_at_schema_version() -> None:
@@ -24,12 +24,12 @@ def test_init_is_idempotent() -> None:
     assert first == second == db.SCHEMA_VERSION
 
 
-def test_all_six_tables_exist(initialised_db: int) -> None:
+def test_all_tables_exist(initialised_db: int) -> None:
     with db.connection() as conn:
         rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
     names = {r["name"] for r in rows}
 
-    assert {"sources", "jobs", "transcripts", "clips", "clip_edits", "exports"} <= names
+    assert {"sources", "jobs", "transcripts", "clips", "clip_edits", "exports", "presets"} <= names
 
 
 def test_foreign_keys_are_enforced(initialised_db: int) -> None:
@@ -290,6 +290,88 @@ class TestTranscriptsEditsAndExports:
         assert reloaded.crop_nudge == pytest.approx(0.5)
         assert reloaded.centre_crop is True
 
+    def test_clip_edit_round_trips_style_overrides(self, job: Job) -> None:
+        clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
+        store.replace_clips(job.id, [clip])
+        overrides = {"font": "Anton", "size_ratio": 0.08, "accent": None, "max_words": 2}
+
+        store.upsert_clip_edit(ClipEdit(clip_id=clip.id, style_overrides=overrides))
+
+        loaded = store.get_clip_edit(clip.id)
+        assert loaded is not None
+        assert loaded.style_overrides == overrides
+
+    def test_clip_edit_round_trips_caption_geometry(self, job: Job) -> None:
+        clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
+        store.replace_clips(job.id, [clip])
+
+        store.upsert_clip_edit(
+            ClipEdit(clip_id=clip.id, caption_margin_ratio=0.12, caption_x_ratio=0.2)
+        )
+
+        loaded = store.get_clip_edit(clip.id)
+        assert loaded is not None
+        assert loaded.caption_margin_ratio == pytest.approx(0.12)
+        assert loaded.caption_x_ratio == pytest.approx(0.2)
+
+    def test_an_edit_without_styling_reads_back_as_null(self, job: Job) -> None:
+        clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
+        store.replace_clips(job.id, [clip])
+
+        store.upsert_clip_edit(ClipEdit(clip_id=clip.id))
+
+        loaded = store.get_clip_edit(clip.id)
+        assert loaded is not None
+        # Null, not an empty blob: there is one representation of "no overrides",
+        # and the resolver treats both the same way.
+        assert loaded.style_overrides is None
+        assert loaded.caption_margin_ratio is None
+        assert loaded.caption_x_ratio is None
+
+    def test_clearing_styling_persists_the_clear(self, job: Job) -> None:
+        clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
+        store.replace_clips(job.id, [clip])
+        store.upsert_clip_edit(
+            ClipEdit(
+                clip_id=clip.id,
+                style_overrides={"font": "Anton"},
+                caption_x_ratio=0.3,
+            )
+        )
+
+        store.upsert_clip_edit(
+            ClipEdit(clip_id=clip.id, style_overrides=None, caption_x_ratio=None)
+        )
+
+        loaded = store.get_clip_edit(clip.id)
+        assert loaded is not None
+        assert loaded.style_overrides is None
+        assert loaded.caption_x_ratio is None
+
+    def test_a_pre_styling_row_still_loads(self, job: Job) -> None:
+        # Contract §8.2: the reviewer's existing job — written before these
+        # columns existed — must load and re-export unchanged.
+        clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
+        store.replace_clips(job.id, [clip])
+        store.upsert_clip_edit(ClipEdit(clip_id=clip.id, caption_style="boxed"))
+
+        with db.connection() as conn:
+            conn.execute(
+                """
+                UPDATE clip_edits
+                   SET style_overrides_json = NULL,
+                       caption_margin_ratio = NULL,
+                       caption_x_ratio = NULL
+                 WHERE clip_id = ?
+                """,
+                (clip.id,),
+            )
+
+        loaded = store.get_clip_edit(clip.id)
+        assert loaded is not None
+        assert loaded.caption_style == "boxed"
+        assert loaded.style_overrides is None
+
     def test_clip_edit_round_trips_pip_settings(self, job: Job) -> None:
         clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
         store.replace_clips(job.id, [clip])
@@ -314,3 +396,168 @@ class TestTranscriptsEditsAndExports:
         store.create_export(Export(id=new_id(), clip_id=clip.id, path="out_1x1.mp4", ratio="1:1"))
 
         assert len(store.list_exports(clip.id)) == 2
+
+
+class TestPresets:
+    """Contract §4: presets are templates, and the default is unique."""
+
+    @pytest.fixture(autouse=True)
+    def _schema(self, initialised_db: int) -> None:
+        """A migrated database — the table is new, so nothing else creates it."""
+
+    @pytest.fixture
+    def job(self, initialised_db: int) -> Job:
+        source = store.create_source(_make_source())
+        return store.create_job(Job(id=new_id(), source_id=source.id))
+
+    @pytest.fixture
+    def clip(self, job: Job) -> Clip:
+        clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
+        store.replace_clips(job.id, [clip])
+        return clip
+
+    def _preset(self, name: str = "On brand", **overrides) -> Preset:
+        return Preset(id=new_id(), name=name, **overrides)
+
+    def test_create_and_get(self) -> None:
+        preset = self._preset(base_style="karaoke_fill", style_overrides={"font": "Inter"})
+
+        store.create_preset(preset)
+
+        loaded = store.get_preset(preset.id)
+        assert loaded is not None
+        assert loaded.name == "On brand"
+        assert loaded.base_style == "karaoke_fill"
+        assert loaded.style_overrides == {"font": "Inter"}
+
+    def test_a_duplicate_name_is_refused(self) -> None:
+        store.create_preset(self._preset(name="Same"))
+
+        with pytest.raises(sqlite3.IntegrityError):
+            store.create_preset(self._preset(name="Same"))
+
+    def test_the_default_lists_first(self) -> None:
+        first = self._preset(name="Alpha")
+        second = self._preset(name="Beta")
+        store.create_preset(first)
+        store.create_preset(second)
+        store.set_default_preset(second.id)
+
+        listed = store.list_presets()
+
+        assert [p.name for p in listed] == ["Beta", "Alpha"]
+        assert listed[0].is_default is True
+
+    def test_only_one_default_at_a_time(self) -> None:
+        first = self._preset(name="Alpha")
+        second = self._preset(name="Beta")
+        store.create_preset(first)
+        store.create_preset(second)
+
+        store.set_default_preset(first.id)
+        store.set_default_preset(second.id)
+
+        assert store.default_preset().id == second.id
+        assert store.get_preset(first.id).is_default is False
+
+    def test_a_second_default_row_is_impossible(self) -> None:
+        # The partial unique index is the backstop: nothing can leave two
+        # defaults behind even if the clearing step were ever skipped.
+        store.create_preset(self._preset(name="Alpha", is_default=True))
+
+        with pytest.raises(sqlite3.IntegrityError):
+            store.create_preset(self._preset(name="Beta", is_default=True))
+
+    def test_update_patches_only_supplied_fields(self) -> None:
+        preset = self._preset(style_overrides={"font": "Anton"}, layout={"caption_x_ratio": 0.2})
+        store.create_preset(preset)
+
+        store.update_preset(preset.id, name="Renamed")
+
+        loaded = store.get_preset(preset.id)
+        assert loaded is not None
+        assert loaded.name == "Renamed"
+        assert loaded.style_overrides == {"font": "Anton"}
+        assert loaded.layout == {"caption_x_ratio": 0.2}
+
+    def test_update_can_clear_a_blob(self) -> None:
+        preset = self._preset(style_overrides={"font": "Anton"})
+        store.create_preset(preset)
+
+        store.update_preset(preset.id, style_overrides=None)
+
+        assert store.get_preset(preset.id).style_overrides is None
+
+    def test_delete_reports_whether_it_found_one(self) -> None:
+        preset = self._preset()
+        store.create_preset(preset)
+
+        assert store.delete_preset(preset.id) is True
+        assert store.delete_preset(preset.id) is False
+
+    def test_deleting_the_default_leaves_none(self) -> None:
+        preset = self._preset()
+        store.create_preset(preset)
+        store.set_default_preset(preset.id)
+
+        store.delete_preset(preset.id)
+
+        assert store.default_preset() is None
+
+    def test_apply_copies_the_style_and_layout_onto_the_clip(self, clip: Clip) -> None:
+        preset = self._preset(
+            base_style="boxed",
+            style_overrides={"font": "Bebas Neue", "max_words": 2},
+            layout={"caption_margin_ratio": 0.15, "caption_x_ratio": 0.25},
+        )
+
+        store.apply_preset_to_clips([clip.id], preset)
+
+        edit = store.get_clip_edit(clip.id)
+        assert edit is not None
+        assert edit.caption_style == "boxed"
+        assert edit.style_overrides == {"font": "Bebas Neue", "max_words": 2}
+        assert edit.caption_margin_ratio == pytest.approx(0.15)
+        assert edit.caption_x_ratio == pytest.approx(0.25)
+
+    def test_apply_keeps_the_clip_own_edits(self, clip: Clip) -> None:
+        store.upsert_clip_edit(
+            ClipEdit(clip_id=clip.id, crop_nudge=0.4, pip_enabled=True, pip_corner="bl")
+        )
+        preset = self._preset(style_overrides={"font": "Inter"})
+
+        store.apply_preset_to_clips([clip.id], preset)
+
+        edit = store.get_clip_edit(clip.id)
+        assert edit is not None
+        assert edit.crop_nudge == pytest.approx(0.4)
+        assert edit.pip_enabled is True
+        assert edit.pip_corner == "bl"
+        assert edit.style_overrides == {"font": "Inter"}
+
+    def test_clips_carry_copies_so_deleting_the_preset_changes_nothing(
+        self, clip: Clip
+    ) -> None:
+        preset = self._preset(style_overrides={"font": "Inter"})
+        store.create_preset(preset)
+        store.apply_preset_to_clips([clip.id], preset)
+
+        store.delete_preset(preset.id)
+
+        edit = store.get_clip_edit(clip.id)
+        assert edit is not None
+        assert edit.style_overrides == {"font": "Inter"}
+
+    def test_the_copy_is_independent_of_the_preset_object(self, clip: Clip) -> None:
+        overrides = {"font": "Inter"}
+        preset = self._preset(style_overrides=overrides)
+        store.apply_preset_to_clips([clip.id], preset)
+
+        # Mutating the preset's blob in memory must not reach the clip: it was
+        # deep-copied, not aliased.
+        preset.style_overrides["font"] = "Anton"
+
+        assert store.get_clip_edit(clip.id).style_overrides == {"font": "Inter"}
+
+    def test_applying_to_no_clips_is_a_noop(self) -> None:
+        store.apply_preset_to_clips([], self._preset())
