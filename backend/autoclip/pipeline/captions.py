@@ -425,6 +425,15 @@ def preview_payload(style: CaptionStyle) -> dict[str, Any]:
         "alignment": style.alignment,
         "margin_ratio": style.margin_v_ratio,
         "xRatio": style.x_ratio,
+        # The three §2/§3-critical fields also travel under their snake_case
+        # names: §3 names the geometry keys that way, and the review client reads
+        # them so. Falling back through ClipOut was correct in every reachable
+        # state, but a hand-written API call could store an x inside the snap
+        # band and make the preview disagree with the burn — belt and braces
+        # costs three keys.
+        "x_ratio": style.x_ratio,
+        "box_colour": style.box_colour,
+        "box_alpha": style.box_alpha,
     }
 
 

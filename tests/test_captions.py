@@ -534,13 +534,16 @@ class TestPreviewPayload:
 
         assert payload["alignment"] == "left"
         assert payload["xRatio"] == pytest.approx(0.2)
+        assert payload["x_ratio"] == pytest.approx(0.2)
         assert payload["margin_ratio"] == pytest.approx(style.margin_v_ratio)
 
     def test_carries_the_box_style_the_css_needs(self) -> None:
         payload = captions.preview_payload(captions.get_style("boxed"))
 
         assert payload["boxColour"] == "#000000"
+        assert payload["box_colour"] == "#000000"
         assert payload["boxAlpha"] == captions.PRESETS["boxed"].box_alpha
+        assert payload["box_alpha"] == captions.PRESETS["boxed"].box_alpha
 
     def test_reflects_overrides(self) -> None:
         style = captions.resolve_style(
