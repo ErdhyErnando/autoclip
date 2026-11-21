@@ -28,6 +28,7 @@ from .schemas import (
     ExportOut,
     ExportRequestIn,
     FacecamOut,
+    FontOut,
     WordOut,
 )
 
@@ -441,6 +442,16 @@ async def caption_styles() -> list[CaptionStyleOut]:
         )
         for style in captions_module.PRESETS.values()
     ]
+
+
+@router.get("/fonts", response_model=list[FontOut])
+async def fonts() -> list[FontOut]:
+    """The bundled font registry — the style editor's font dropdown.
+
+    Nothing is fetched at runtime; these are committed OFL faces staged into the
+    render workspace alongside the ASS file, so an export works offline.
+    """
+    return [FontOut(key=spec.key, label=spec.label) for spec in captions_module.FONTS.values()]
 
 
 # --------------------------------------------------------------------------

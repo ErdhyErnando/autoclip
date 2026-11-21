@@ -53,10 +53,19 @@ class FontSpec:
 
 
 #: Every font the renderer may name (contract §5). All SIL OFL, committed to
-#: git — nothing is fetched at runtime, so exporting works offline.
+#: git — nothing is fetched at runtime, so exporting works offline. Keys are the
+#: ASS family names, which is what libass resolves out of each file, so what a
+#: client posts back as ``style_overrides.font`` is exactly what gets burned.
 FONTS: dict[str, FontSpec] = {
     "Anton": FontSpec(key="Anton", label="Anton", file="Anton-Regular.ttf"),
     "Inter": FontSpec(key="Inter", label="Inter", file="Inter-Variable.ttf"),
+    "Archivo Black": FontSpec(
+        key="Archivo Black", label="Archivo Black", file="ArchivoBlack-Regular.ttf"
+    ),
+    "Bebas Neue": FontSpec(
+        key="Bebas Neue", label="Bebas Neue", file="BebasNeue-Regular.ttf"
+    ),
+    "Lilita One": FontSpec(key="Lilita One", label="Lilita One", file="LilitaOne-Regular.ttf"),
 }
 
 

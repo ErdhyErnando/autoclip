@@ -296,6 +296,13 @@ class CaptionStyleOut(BaseModel):
     preview: dict[str, Any]
 
 
+class FontOut(BaseModel):
+    """One bundled font, as the style editor's dropdown sees it."""
+
+    key: str
+    label: str
+
+
 class ProviderStatusOut(BaseModel):
     name: str
     available: bool

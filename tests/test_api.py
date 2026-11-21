@@ -785,3 +785,28 @@ class TestSecretsNeverLeak:
 
         assert "DEADBEEF" not in paths.config_path().read_text(encoding="utf-8")
         assert config.get_secret("anthropic") == "sk-DEADBEEF"
+
+
+class TestFonts:
+    def test_lists_the_registry(self, client: TestClient) -> None:
+        fonts = client.get("/api/fonts").json()
+
+        assert len(fonts) >= 5
+        assert all({"key", "label"} == set(f.keys()) for f in fonts)
+
+    def test_includes_the_display_faces(self, client: TestClient) -> None:
+        keys = {f["key"] for f in client.get("/api/fonts").json()}
+
+        assert {"Anton", "Inter", "Archivo Black", "Bebas Neue", "Lilita One"} <= keys
+
+    def test_every_listed_font_is_usable(self, client: TestClient, job_with_clips: Job) -> None:
+        clip_id = client.get(f"/api/jobs/{job_with_clips.id}/clips").json()[0]["id"]
+
+        for font in client.get("/api/fonts").json():
+            response = client.patch(
+                f"/api/clips/{clip_id}/captions",
+                json={"style_overrides": {"font": font["key"]}},
+            )
+
+            assert response.status_code == 200, font
+            assert response.json()["style_overrides"]["font"] == font["key"]

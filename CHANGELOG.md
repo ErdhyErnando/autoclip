@@ -34,6 +34,15 @@ fonts, and reusable presets. The interface both workstreams build against is
   approximation can follow per-clip overrides.
 - **Words per screen.** A clip's `max_words` (1–8) now reaches `group_words`, so
   one word per group — the snappy look — is finally reachable from the editor.
+- **Three more caption fonts.** Archivo Black, Bebas Neue and Lilita One join
+  Anton and Inter in a font registry (`captions.FONTS`), exposed as
+  `GET /api/fonts` for the style editor's picker, and `CaptionStyle.font` is
+  validated against it — an unknown key is a 400 rather than a silent libass
+  substitution that would look nothing like the preview. All five faces are SIL
+  OFL, committed to the repo, and staged into the render workspace with the ASS
+  file, so nothing is fetched at runtime. Lilita One ships at 28 KB, smaller than
+  the other four; it was verified as a genuine TrueType file (magic bytes, family
+  name, name table) rather than by size alone.
 
 ### Fixed
 

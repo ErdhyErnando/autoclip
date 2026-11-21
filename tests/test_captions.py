@@ -552,3 +552,55 @@ class TestPreviewPayload:
         assert payload["font"] == "Inter"
         assert payload["maxWords"] == 2
         assert payload["outlineWidth"] == pytest.approx(1.0)
+
+
+class TestFontRegistry:
+    """Contract §5: everything the renderer can name is bundled and usable."""
+
+    #: TrueType outlines. ``true``/``ttcf`` cover the rarer wrappers, and an HTML
+    #: error page or a Git LFS pointer fails all of them — which is the failure
+    #: this catches, because both look like a file on disk.
+    TTF_MAGIC = (b"\x00\x01\x00\x00", b"true", b"ttcf")
+
+    def test_offers_at_least_five_faces(self) -> None:
+        assert len(captions.FONTS) >= 5
+
+    def test_keys_match_the_family_the_ass_style_emits(self) -> None:
+        for key, spec in captions.FONTS.items():
+            assert spec.key == key
+
+    def test_labels_are_not_empty(self) -> None:
+        assert all(spec.label.strip() for spec in captions.FONTS.values())
+
+    @pytest.mark.parametrize("key", list(captions.FONTS))
+    def test_every_registered_font_ships_its_file(self, key: str) -> None:
+        assert captions.get_font(key).path.exists()
+
+    @pytest.mark.parametrize("key", list(captions.FONTS))
+    def test_every_registered_font_is_a_real_ttf(self, key: str) -> None:
+        raw = captions.get_font(key).path.read_bytes()
+
+        assert raw[:4] in self.TTF_MAGIC
+        # An LFS pointer is a ~130-byte text file. This is a floor for "has
+        # outlines", not a beauty contest.
+        assert len(raw) > 5_000
+
+    @pytest.mark.parametrize("key", list(captions.FONTS))
+    def test_every_registered_font_renders(self, key: str) -> None:
+        style = captions.resolve_style("bold_pop", overrides={"font": key})
+
+        subs = captions.build_ass(
+            evenly_spaced(["hello", "world"]), style, width=1080, height=1920
+        )
+
+        assert subs.styles[captions.STYLE_NAME].fontname == key
+        assert len(subs.events) > 0
+
+    def test_unknown_font_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown font"):
+            captions.get_font("Comic Sans MS")
+
+    def test_a_font_outside_the_registry_is_ignored_by_resolution(self) -> None:
+        style = captions.resolve_style("bold_pop", overrides={"font": "Comic Sans MS"})
+
+        assert style.font == captions.PRESETS["bold_pop"].font
