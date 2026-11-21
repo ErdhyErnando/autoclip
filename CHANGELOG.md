@@ -5,8 +5,19 @@ versions follow [semantic versioning](https://semver.org/) once 0.1.0 ships.
 
 ## Unreleased
 
-Nothing yet. Validation work after the release lands here — the golden-set
-machinery is [docs/goldens.md](docs/goldens.md).
+The promo-editor epic ([#16](https://github.com/ErdhyErnando/autoclip/issues/16))
+lands here: per-clip caption styling, x-axis caption placement, more bundled
+fonts, and reusable presets. The interface both workstreams build against is
+[docs/promo-editor-contract.md](docs/promo-editor-contract.md).
+
+### Fixed
+
+- **The review UI's export button could overwrite another clip's file.** Two
+  clips sharing a title — which an LLM is free to produce — wrote one filename,
+  so exporting B clobbered A's render while A's `Export` row kept pointing at
+  it. Batch export already appended the clip's rank (`a699ea6`); the endpoint
+  now disambiguates the same way, seeded from the job's persisted exports.
+  Re-exporting the same clip still overwrites itself, which is correct.
 
 ## 0.1.0 — 2026-11-20
 

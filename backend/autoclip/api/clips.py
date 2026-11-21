@@ -298,11 +298,7 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
 
     pip = _pip_for_export(workspace, clip, source, payload, stored_edit, payload.ratio)
 
-    destination = (
-        paths.exports_dir()
-        / clip.job_id
-        / export_module.output_filename(clip.title or f"clip-{clip.rank}", payload.ratio)
-    )
+    destination = _export_destination(clip, payload.ratio)
 
     request = export_module.ExportRequest(
         source=Path(source.path),
@@ -412,6 +408,38 @@ async def caption_styles() -> list[CaptionStyleOut]:
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+
+def _export_destination(clip, ratio: str) -> Path:
+    """Where this clip's render lands, disambiguated against its siblings.
+
+    Mirrors the pipeline's used-name logic (``pipeline/runner.py``): a title
+    alone is not unique, an LLM is free to reuse one, and two clips writing the
+    same filename means the second export silently clobbers the first while the
+    first clip's ``Export`` row keeps pointing at the clobbered path.
+
+    The seed for disambiguation is the job's *persisted* exports for *other*
+    clips, not an in-memory set, because each API export stands alone — there is
+    no batch to accumulate names across. That also gives us the semantics the
+    endpoint needs: re-exporting the same clip sees only its siblings' names, so
+    it keeps overwriting its own file.
+    """
+    owned: set[str] = set()
+    for sibling in store.list_clips(clip.job_id):
+        if sibling.id == clip.id:
+            continue
+        owned.update(Path(record.path).name for record in store.list_exports(sibling.id))
+
+    title = clip.title or f"clip-{clip.rank}"
+    filename = export_module.output_filename(title, ratio)
+    # The rank is unique within a job. The loop closes the pathological case
+    # where a rank-suffixed slug happens to equal another clip's plain slug.
+    variant = clip.rank if filename in owned else None
+    while filename in owned:
+        variant = (variant or 0) + 1
+        filename = export_module.output_filename(title, ratio, variant=variant)
+
+    return paths.exports_dir() / clip.job_id / filename
 
 
 def _load_transcript(job_id: str) -> Transcript:

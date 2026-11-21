@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from autoclip import app as app_module
 from autoclip import config
+from autoclip.api import clips as clips_module
 from autoclip.app import create_app
 from autoclip.db import store
 from autoclip.db.models import Clip, Job, Source, new_id
@@ -42,6 +44,19 @@ def source() -> Source:
             fps=30.0,
         )
     )
+
+
+def _write_transcript(job_id: str, *, count: int) -> None:
+    """Drop a transcript where the job workspace expects one.
+
+    The clip word endpoints (and therefore the export path, which reads its
+    words through them) 404 without this.
+    """
+    from autoclip.pipeline.runner import JobWorkspace
+    from autoclip.pipeline.transcript import Transcript, Word
+
+    words = [Word(text=f"word{i}", start=i * 0.4, end=i * 0.4 + 0.3) for i in range(count)]
+    Transcript(words=words).save(JobWorkspace(job_id).transcript)
 
 
 class TestHealthAndSystem:
@@ -395,6 +410,128 @@ class TestClips:
         clip_id = client.get(f"/api/jobs/{job_with_clips.id}/clips").json()[0]["id"]
 
         assert client.get(f"/api/clips/{clip_id}/words").status_code == 404
+
+
+class TestExportFilenames:
+    """Two clips may share a title; their renders may not share a file."""
+
+    TITLE = "Opening stretch"
+
+    @pytest.fixture
+    def same_titled_clips(self, source: Source) -> Job:
+        job = store.create_job(Job(id=new_id(), source_id=source.id, status="done"))
+        store.replace_clips(
+            job.id,
+            [
+                Clip(
+                    id=new_id(),
+                    job_id=job.id,
+                    rank=rank,
+                    start_s=(rank - 1) * 10.0,
+                    end_s=(rank - 1) * 10.0 + 5.0,
+                    start_word=(rank - 1) * 10,
+                    end_word=(rank - 1) * 10 + 9,
+                    title=self.TITLE,
+                )
+                for rank in (1, 2)
+            ],
+        )
+        _write_transcript(job.id, count=40)
+        return job
+
+    @pytest.fixture
+    def rendered(self, monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+        """Replace the renderer with one that just writes a byte.
+
+        This class is about where the file lands, not what is inside it. A real
+        encode here would add minutes to the default suite and test ffmpeg
+        rather than the filename derivation these tests exist for.
+        """
+        written: list[Path] = []
+
+        def fake_render(request, **_kwargs):
+            request.destination.parent.mkdir(parents=True, exist_ok=True)
+            request.destination.write_bytes(b"fake render")
+            written.append(request.destination)
+            return request.destination
+
+        monkeypatch.setattr(clips_module.export_module, "export_clip", fake_render)
+        return written
+
+    def test_two_same_titled_clips_write_two_files(
+        self, client: TestClient, same_titled_clips: Job, rendered: list[Path]
+    ) -> None:
+        clips = client.get(f"/api/jobs/{same_titled_clips.id}/clips").json()
+
+        responses = [
+            client.post(f"/api/clips/{clip['id']}/export", json={"ratio": "9:16"})
+            for clip in clips
+        ]
+
+        assert [r.status_code for r in responses] == [201, 201]
+        assert len(rendered) == 2
+        assert len(set(rendered)) == 2, "both clips wrote the same file"
+        assert all(path.exists() for path in rendered)
+
+    def test_each_clip_row_points_at_its_own_render(
+        self, client: TestClient, same_titled_clips: Job, rendered: list[Path]
+    ) -> None:
+        clips = client.get(f"/api/jobs/{same_titled_clips.id}/clips").json()
+        responses = [
+            client.post(f"/api/clips/{clip['id']}/export", json={"ratio": "9:16"})
+            for clip in clips
+        ]
+
+        for response, path in zip(responses, rendered, strict=True):
+            record = store.get_export(response.json()["id"])
+
+            assert record is not None
+            # The bug this closes: B's render overwrote A's file while A's row
+            # kept pointing at a path that now held someone else's video.
+            assert Path(record.path) == path
+
+        assert [store.get_export(r.json()["id"]).clip_id for r in responses] == [
+            clip["id"] for clip in clips
+        ]
+
+    def test_re_exporting_a_clip_keeps_overwriting_itself(
+        self, client: TestClient, same_titled_clips: Job, rendered: list[Path]
+    ) -> None:
+        clip = client.get(f"/api/jobs/{same_titled_clips.id}/clips").json()[0]
+
+        first = client.post(f"/api/clips/{clip['id']}/export", json={"ratio": "9:16"})
+        second = client.post(f"/api/clips/{clip['id']}/export", json={"ratio": "9:16"})
+
+        assert Path(store.get_export(first.json()["id"]).path) == Path(
+            store.get_export(second.json()["id"]).path
+        )
+
+    def test_a_disambiguated_clip_is_stable_across_re_exports(
+        self, client: TestClient, same_titled_clips: Job, rendered: list[Path]
+    ) -> None:
+        # The sibling was rendered first, so this clip is the one that gets a
+        # variant. It must keep that variant on every later export rather than
+        # drifting between names.
+        clips = client.get(f"/api/jobs/{same_titled_clips.id}/clips").json()
+        client.post(f"/api/clips/{clips[0]['id']}/export", json={"ratio": "9:16"})
+
+        first = client.post(f"/api/clips/{clips[1]['id']}/export", json={"ratio": "9:16"})
+        second = client.post(f"/api/clips/{clips[1]['id']}/export", json={"ratio": "9:16"})
+
+        assert Path(store.get_export(first.json()["id"]).path) == Path(
+            store.get_export(second.json()["id"]).path
+        )
+        assert len(set(rendered)) == 2
+
+    def test_a_different_ratio_still_gets_its_own_file(
+        self, client: TestClient, same_titled_clips: Job, rendered: list[Path]
+    ) -> None:
+        clip_id = client.get(f"/api/jobs/{same_titled_clips.id}/clips").json()[0]["id"]
+
+        client.post(f"/api/clips/{clip_id}/export", json={"ratio": "9:16"})
+        client.post(f"/api/clips/{clip_id}/export", json={"ratio": "1:1"})
+
+        assert len(set(rendered)) == 2
 
 
 class TestProviderStatus:
