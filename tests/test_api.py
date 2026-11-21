@@ -810,3 +810,216 @@ class TestFonts:
 
             assert response.status_code == 200, font
             assert response.json()["style_overrides"]["font"] == font["key"]
+
+
+class TestPresets:
+    """Contract §4: CRUD, apply, and the single default."""
+
+    @staticmethod
+    def _create(client: TestClient, **overrides):
+        payload = {
+            "name": "On brand",
+            "base_style": "bold_pop",
+            "style_overrides": {"font": "Bebas Neue", "max_words": 2},
+            "layout": {"caption_margin_ratio": 0.15, "caption_x_ratio": 0.25},
+        }
+        payload.update(overrides)
+        return client.post("/api/presets", json=payload)
+
+    def test_empty_initially(self, client: TestClient) -> None:
+        assert client.get("/api/presets").json() == []
+
+    def test_create_returns_201_with_the_preset(self, client: TestClient) -> None:
+        response = self._create(client)
+
+        assert response.status_code == 201
+        body = response.json()
+        assert body["name"] == "On brand"
+        assert body["base_style"] == "bold_pop"
+        assert body["style_overrides"]["font"] == "Bebas Neue"
+        assert body["layout"]["caption_x_ratio"] == pytest.approx(0.25)
+        assert body["is_default"] is False
+
+    def test_a_duplicate_name_conflicts(self, client: TestClient) -> None:
+        self._create(client)
+
+        assert self._create(client).status_code == 409
+
+    def test_names_are_trimmed_so_whitespace_does_not_make_a_twin(
+        self, client: TestClient
+    ) -> None:
+        self._create(client, name="On brand")
+
+        assert self._create(client, name="  On brand  ").status_code == 409
+
+    def test_a_blank_name_is_rejected(self, client: TestClient) -> None:
+        assert self._create(client, name="   ").status_code in (400, 422)
+
+    def test_an_unknown_base_style_is_a_400(self, client: TestClient) -> None:
+        response = self._create(client, base_style="neon-explosion")
+
+        assert response.status_code == 400
+        assert "Unknown caption style" in response.json()["detail"]
+
+    def test_an_unknown_font_is_a_400(self, client: TestClient) -> None:
+        response = self._create(client, style_overrides={"font": "Comic Sans MS"})
+
+        assert response.status_code == 400
+        assert "Unknown font" in response.json()["detail"]
+
+    def test_out_of_range_geometry_is_clamped_not_rejected(self, client: TestClient) -> None:
+        response = self._create(
+            client, layout={"caption_margin_ratio": 9.0, "caption_x_ratio": -2.0}
+        )
+
+        assert response.status_code == 201
+        layout = response.json()["layout"]
+        assert layout["caption_margin_ratio"] == pytest.approx(0.8)
+        assert layout["caption_x_ratio"] == pytest.approx(0.0)
+
+    def test_the_default_lists_first(self, client: TestClient) -> None:
+        self._create(client, name="Alpha").json()
+        second = self._create(client, name="Beta").json()
+        client.put(f"/api/presets/{second['id']}/default")
+
+        listed = client.get("/api/presets").json()
+
+        assert [p["name"] for p in listed] == ["Beta", "Alpha"]
+        assert listed[0]["is_default"] is True
+
+    def test_setting_a_default_clears_the_previous_one(self, client: TestClient) -> None:
+        first = self._create(client, name="Alpha").json()
+        second = self._create(client, name="Beta").json()
+
+        client.put(f"/api/presets/{first['id']}/default")
+        client.put(f"/api/presets/{second['id']}/default")
+
+        presets = {p["id"]: p for p in client.get("/api/presets").json()}
+        assert presets[first["id"]]["is_default"] is False
+        assert presets[second["id"]]["is_default"] is True
+
+    def test_defaulting_a_missing_preset_is_404(self, client: TestClient) -> None:
+        assert client.put("/api/presets/nope/default").status_code == 404
+
+    def test_partial_update_leaves_other_fields_alone(self, client: TestClient) -> None:
+        created = self._create(client).json()
+
+        response = client.put(f"/api/presets/{created['id']}", json={"name": "Renamed"})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["name"] == "Renamed"
+        assert body["style_overrides"]["font"] == "Bebas Neue"
+        assert body["layout"]["caption_x_ratio"] == pytest.approx(0.25)
+
+    def test_update_can_clear_a_blob(self, client: TestClient) -> None:
+        created = self._create(client).json()
+
+        response = client.put(f"/api/presets/{created['id']}", json={"style_overrides": None})
+
+        assert response.json()["style_overrides"] is None
+        assert response.json()["layout"] is not None
+
+    def test_renaming_onto_a_taken_name_conflicts(self, client: TestClient) -> None:
+        self._create(client, name="Alpha")
+        beta = self._create(client, name="Beta").json()
+
+        response = client.put(f"/api/presets/{beta['id']}", json={"name": "Alpha"})
+
+        assert response.status_code == 409
+
+    def test_update_rejects_an_unknown_base_style(self, client: TestClient) -> None:
+        created = self._create(client).json()
+
+        response = client.put(
+            f"/api/presets/{created['id']}", json={"base_style": "neon-explosion"}
+        )
+
+        assert response.status_code == 400
+
+    def test_updating_a_missing_preset_is_404(self, client: TestClient) -> None:
+        assert client.put("/api/presets/nope", json={"name": "x"}).status_code == 404
+
+    def test_delete_is_204_then_404(self, client: TestClient) -> None:
+        created = self._create(client).json()
+
+        assert client.delete(f"/api/presets/{created['id']}").status_code == 204
+        assert client.delete(f"/api/presets/{created['id']}").status_code == 404
+
+    def test_apply_reproduces_the_style_and_layout(
+        self, client: TestClient, job_with_clips: Job
+    ) -> None:
+        preset = self._create(client).json()
+        clip_id = client.get(f"/api/jobs/{job_with_clips.id}/clips").json()[0]["id"]
+
+        response = client.post(f"/api/presets/{preset['id']}/apply", json={"clip_id": clip_id})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["caption_style"] == "bold_pop"
+        assert body["style_overrides"] == {"font": "Bebas Neue", "max_words": 2}
+        assert body["caption_margin_ratio"] == pytest.approx(0.15)
+        assert body["caption_x_ratio"] == pytest.approx(0.25)
+
+    def test_apply_updates_the_published_snapshot(
+        self, client: TestClient, job_with_clips: Job
+    ) -> None:
+        # Contract §8.1: what the preview draws must be what the renderer burns,
+        # and applying a preset is exactly the moment they could diverge.
+        preset = self._create(client).json()
+        clip_id = client.get(f"/api/jobs/{job_with_clips.id}/clips").json()[0]["id"]
+
+        client.post(f"/api/presets/{preset['id']}/apply", json={"clip_id": clip_id})
+
+        effective = client.get(f"/api/clips/{clip_id}").json()["effective_caption"]
+        assert effective["font"] == "Bebas Neue"
+        assert effective["maxWords"] == 2
+        assert effective["alignment"] == "left"
+        assert effective["xRatio"] == pytest.approx(0.25)
+        assert effective["margin_ratio"] == pytest.approx(0.15)
+
+    def test_apply_to_a_missing_clip_is_404(
+        self, client: TestClient, job_with_clips: Job
+    ) -> None:
+        preset = self._create(client).json()
+
+        response = client.post(f"/api/presets/{preset['id']}/apply", json={"clip_id": "nope"})
+
+        assert response.status_code == 404
+
+    def test_applying_a_missing_preset_is_404(
+        self, client: TestClient, job_with_clips: Job
+    ) -> None:
+        clip_id = client.get(f"/api/jobs/{job_with_clips.id}/clips").json()[0]["id"]
+
+        response = client.post("/api/presets/nope/apply", json={"clip_id": clip_id})
+
+        assert response.status_code == 404
+
+    def test_deleting_a_preset_leaves_the_clip_styled(
+        self, client: TestClient, job_with_clips: Job
+    ) -> None:
+        preset = self._create(client).json()
+        clip_id = client.get(f"/api/jobs/{job_with_clips.id}/clips").json()[0]["id"]
+        client.post(f"/api/presets/{preset['id']}/apply", json={"clip_id": clip_id})
+
+        client.delete(f"/api/presets/{preset['id']}")
+
+        clip = client.get(f"/api/clips/{clip_id}").json()
+        assert clip["style_overrides"] == {"font": "Bebas Neue", "max_words": 2}
+        assert clip["caption_x_ratio"] == pytest.approx(0.25)
+
+    def test_editing_a_preset_leaves_an_applied_clip_alone(
+        self, client: TestClient, job_with_clips: Job
+    ) -> None:
+        preset = self._create(client).json()
+        clip_id = client.get(f"/api/jobs/{job_with_clips.id}/clips").json()[0]["id"]
+        client.post(f"/api/presets/{preset['id']}/apply", json={"clip_id": clip_id})
+
+        client.put(
+            f"/api/presets/{preset['id']}",
+            json={"style_overrides": {"font": "Inter", "max_words": 8}},
+        )
+
+        clip = client.get(f"/api/clips/{clip_id}").json()
+        assert clip["style_overrides"] == {"font": "Bebas Neue", "max_words": 2}

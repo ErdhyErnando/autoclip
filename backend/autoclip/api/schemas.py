@@ -303,6 +303,63 @@ class FontOut(BaseModel):
     label: str
 
 
+class PresetLayoutIn(BaseModel):
+    """Where a preset puts the caption block (contract §4).
+
+    A separate blob from the style overrides because Phase 2 appends the
+    ``pip_*`` placement fields here: a preset captures look *and* layout, so the
+    style schema should not have to grow for it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Clamped, not rejected, like every other ratio (contract §8.4).
+    caption_margin_ratio: float | None = None
+    caption_x_ratio: float | None = None
+
+
+class PresetIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    base_style: str
+    style_overrides: StyleOverrides | None = None
+    layout: PresetLayoutIn | None = None
+
+
+class PresetPatchIn(BaseModel):
+    """Partial preset update. Absent means unchanged; ``null`` clears."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    base_style: str | None = None
+    style_overrides: StyleOverrides | None = None
+    layout: PresetLayoutIn | None = None
+
+
+class PresetOut(BaseModel):
+    id: str
+    name: str
+    base_style: str
+    style_overrides: dict[str, Any] | None = None
+    layout: dict[str, Any] | None = None
+    is_default: bool = False
+    created_at: str
+
+    @classmethod
+    def of(cls, preset: models.Preset) -> PresetOut:
+        return cls(
+            id=preset.id,
+            name=preset.name,
+            base_style=preset.base_style,
+            style_overrides=preset.style_overrides,
+            layout=preset.layout,
+            is_default=preset.is_default,
+            created_at=preset.created_at,
+        )
+
+
+class PresetApplyIn(BaseModel):
+    clip_id: str
+
+
 class ProviderStatusOut(BaseModel):
     name: str
     available: bool

@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["clips"])
 
 
-def _clip_out(clip, settings=None) -> ClipOut:
+def clip_out(clip, settings=None) -> ClipOut:
     edit = store.get_clip_edit(clip.id)
     exports = store.list_exports(clip.id)
     return ClipOut.of(
@@ -73,7 +73,7 @@ async def list_clips_for_job(job_id: str) -> list[ClipOut]:
     clips = await asyncio.to_thread(store.list_clips, job_id)
     # One settings read for the whole page; resolution itself is pure.
     settings = await asyncio.to_thread(load_settings)
-    return [await asyncio.to_thread(_clip_out, clip, settings) for clip in clips]
+    return [await asyncio.to_thread(clip_out, clip, settings) for clip in clips]
 
 
 @router.get("/clips/{clip_id}", response_model=ClipOut)
@@ -81,7 +81,7 @@ async def get_clip(clip_id: str) -> ClipOut:
     clip = await asyncio.to_thread(store.get_clip, clip_id)
     if clip is None:
         raise HTTPException(status_code=404, detail="Clip not found.")
-    return await asyncio.to_thread(_clip_out, clip)
+    return await asyncio.to_thread(clip_out, clip)
 
 
 @router.get("/clips/{clip_id}/words", response_model=list[WordOut])
@@ -214,7 +214,7 @@ async def patch_clip(clip_id: str, payload: ClipPatchIn) -> ClipOut:
     )
 
     updated = await asyncio.to_thread(store.get_clip, clip_id)
-    return await asyncio.to_thread(_clip_out, updated)
+    return await asyncio.to_thread(clip_out, updated)
 
 
 @router.patch("/clips/{clip_id}/captions", response_model=ClipOut)
@@ -286,7 +286,7 @@ async def patch_captions(clip_id: str, payload: CaptionPatchIn) -> ClipOut:
     )
     await asyncio.to_thread(store.upsert_clip_edit, edit)
 
-    return await asyncio.to_thread(_clip_out, clip)
+    return await asyncio.to_thread(clip_out, clip)
 
 
 @router.post("/clips/{clip_id}/export", response_model=ExportOut, status_code=201)

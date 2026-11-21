@@ -43,6 +43,15 @@ fonts, and reusable presets. The interface both workstreams build against is
   file, so nothing is fetched at runtime. Lilita One ships at 28 KB, smaller than
   the other four; it was verified as a genuine TrueType file (magic bytes, family
   name, name table) rather than by size alone.
+- **Reusable caption presets.** A `presets` table stores a named base style,
+  style-override blob, and layout, with at most one row marked as the default (a
+  partial unique index, so two defaults cannot exist even by accident). Full CRUD
+  under `/api/presets`, plus set-default and apply-to-clip. Applying copies the
+  values onto the clip's edit — so editing or deleting a preset never changes a
+  clip that already carries its look — and a default preset is applied where
+  clips are persisted after highlight detection, so a fresh job opens on-brand
+  with no client round-trip. With no presets configured, nothing changes: no clip
+  edits are written at all.
 
 ### Fixed
 

@@ -298,8 +298,24 @@ class PipelineRunner:
         )
 
         store.replace_clips(self.job.id, clips)
+        self._apply_default_preset(clips)
         self._finish_stage(stage)
         return clips
+
+    def _apply_default_preset(self, clips: list[Clip]) -> None:
+        """Style a fresh job's clips from the default preset, if there is one.
+
+        Applied where clips are persisted rather than at export so the review UI
+        opens on already-on-brand clips — the point of a default is that nobody
+        has to apply it clip by clip. No default means no clip edits are written
+        at all, which is exactly how a job behaved before presets existed.
+        """
+        preset = store.default_preset()
+        if preset is None:
+            return
+
+        store.apply_preset_to_clips([clip.id for clip in clips], preset)
+        log.info("Applied preset %r to %d clip(s).", preset.name, len(clips))
 
     def _stage_reframe(self, clips: list[Clip], transcript: Transcript) -> dict[str, CropPath]:
         stage = Stage.REFRAME
