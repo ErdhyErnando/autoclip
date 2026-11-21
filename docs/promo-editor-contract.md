@@ -123,6 +123,9 @@ Bold — static weights, not variable-font instances, so libass renders the
 intended look). `CaptionStyle.font` must exist in the registry; the captions
 PATCH and presets POST reject unknown font keys with 400.
 
+Endpoint: `GET /api/fonts` → `[{"key": str, "label": str}]` listing the
+registry — this drives the style editor's font dropdown.
+
 ## 6. Phase 2 — PiP placement and crop
 
 Storage (on `clip_edits`):
