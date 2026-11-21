@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-import { formatTimecode, type CaptionStyle, type CropPath, type FacecamBox, type Word } from '../api'
+import {
+  formatTimecode,
+  type CaptionAlignment,
+  type CropPath,
+  type EffectiveCaption,
+  type FacecamBox,
+  type StyleOverrides,
+  type Word,
+} from '../api'
 
 const VOLUME_KEY = 'autoclip.volume'
 
@@ -32,32 +40,47 @@ export function ClipPlayer({
   startS,
   endS,
   words,
-  style,
   ratio,
   cropPath,
   cropNudge = 0,
   centreCrop = false,
-  captionSizeScale = 1,
-  onCaptionGeometry,
+  caption,
+  captionGeometry,
+  captionOverrides,
+  onCaptionPosition,
+  onCaptionSize,
   pip,
 }: {
   src: string
   startS: number
   endS: number
   words: Word[]
-  style: CaptionStyle | undefined
   ratio: string
   cropPath?: CropPath | null
   cropNudge?: number
   centreCrop?: boolean
-  captionSizeScale?: number
-  onCaptionGeometry?: (patch: { sizeScale?: number; positionRatio?: number | null }) => void
+  /** Resolved caption snapshot (clip.effective_caption); null draws nothing. */
+  caption?: EffectiveCaption | null
+  /**
+   * The clip's stored overrides. Only consulted for fields the snapshot does
+   * not carry yet (the box colours), so a picker the user just moved still
+   * moves the preview.
+   */
+  captionOverrides?: StyleOverrides | null
+  /** Stored per-clip geometry; null ratios mean centred / preset default. */
+  captionGeometry?: { xRatio: number | null; marginRatio: number | null }
+  /** Drag release — both ratios at once, per clip (contract §2). */
+  onCaptionPosition?: (patch: { xRatio: number | null; marginRatio: number | null }) => void
+  /** Resize handle release — writes style_overrides.size_ratio (contract §1). */
+  onCaptionSize?: (sizeRatio: number) => void
   /** Facecam inset preview; null renders the normal tracked crop. */
   pip?: { box: FacecamBox; corner: string; size: number } | null
 }) {
   const video = useRef<HTMLVideoElement>(null)
   const pipBg = useRef<HTMLVideoElement>(null)
   const pipInset = useRef<HTMLVideoElement>(null)
+  /** The preview frame — the reference for every caption gesture. */
+  const frame = useRef<HTMLDivElement>(null)
   const [playing, setPlaying] = useState(false)
   const [time, setTime] = useState(startS)
   const [volume, setVolume] = useState(readStoredVolume)
@@ -160,8 +183,11 @@ export function ClipPlayer({
   return (
     <div className="mx-auto flex w-full flex-col items-stretch" style={{ maxWidth }}>
       <div
+        ref={frame}
         className="relative w-full overflow-hidden bg-ink-850"
-        style={{ aspectRatio: `${aspectW} / ${aspectH}` }}
+        // `size` containment makes cqh below mean "this frame's height", so the
+        // caption sizes to the same fraction of the frame the renderer burns.
+        style={{ aspectRatio: `${aspectW} / ${aspectH}`, containerType: 'size' }}
         onClick={toggle}
         role="button"
         tabIndex={0}
@@ -201,9 +227,12 @@ export function ClipPlayer({
         <CaptionOverlay
           words={words}
           time={time}
-          style={style}
-          sizeScale={captionSizeScale}
-          onGeometry={onCaptionGeometry}
+          caption={caption ?? null}
+          geometry={captionGeometry}
+          overrides={captionOverrides}
+          frame={frame}
+          onPosition={onCaptionPosition}
+          onSize={onCaptionSize}
         />
 
         {!playing && (
@@ -613,160 +642,345 @@ function SpeakerIcon({ silent, level }: { silent: boolean; level: number }) {
   )
 }
 
-/** Group words the way the ASS generator does, then show the active group. */
+/* -------------------------------------------------------------------------
+   Caption preview — the CSS mirror of the burn-in
+   ------------------------------------------------------------------------- */
+
+/** Contract §2: a release within ±0.04 of the midpoint snaps to centred. */
+const CENTRE_SNAP = 0.04
+/** Contract §2 clamp range for the vertical inset. */
+const MARGIN_MIN = 0
+const MARGIN_MAX = 0.8
+/** Contract §1 clamp range for size_ratio (fraction of frame height). */
+const SIZE_MIN = 0.02
+const SIZE_MAX = 0.12
+/** Where a caption sits when the anchor came back without an x (see below). */
+const ANCHOR_FALLBACK = 0.06
+/** The preset default the renderer falls back to when nothing sets a margin. */
+const DEFAULT_MARGIN_RATIO = 0.24
+/** Default group size if a snapshot predates the max_words field. */
+const DEFAULT_MAX_WORDS = 3
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value))
+}
+
+/**
+ * Contract §2's alignment maths: either side of the midpoint the caption is
+ * anchored by its edge, and exactly at the midpoint it is centred.
+ */
+function alignmentFor(x: number): CaptionAlignment {
+  if (x < 0.5) return 'left'
+  if (x > 0.5) return 'right'
+  return 'center'
+}
+
+/** ASS alpha is inverted: 0 is opaque, 255 is fully transparent. */
+function withAssAlpha(
+  hex: string | null | undefined,
+  alpha: number | null | undefined,
+): string | undefined {
+  const match = /^#?([0-9a-f]{6})$/i.exec(hex ?? '')
+  if (!match) return undefined
+  const value = match[1]
+  const red = parseInt(value.slice(0, 2), 16)
+  const green = parseInt(value.slice(2, 4), 16)
+  const blue = parseInt(value.slice(4, 6), 16)
+  const opacity = 1 - clamp(alpha ?? 0, 0, 255) / 255
+  return `rgba(${red}, ${green}, ${blue}, ${opacity.toFixed(3)})`
+}
+
+/**
+ * CSS stand-ins for the renderer's font registry (contract §5).
+ *
+ * The real faces live in backend/autoclip/assets/fonts and are burned in by
+ * libass; nothing serves them to the browser and this wave adds no dependencies,
+ * so each key is approximated with the closest stack the browser plus the
+ * bundled Archivo variable face can offer. Letterform and weight land close —
+ * metric-exact it is not, and cannot be without shipping the files.
+ */
+const FONT_LOOKS: Record<string, { stack: string; weight: number }> = {
+  anton: { stack: 'Anton, Impact, "Arial Narrow", sans-serif', weight: 400 },
+  inter: { stack: 'Inter, system-ui, sans-serif', weight: 600 },
+  archivo: { stack: 'Archivo, Impact, sans-serif', weight: 900 },
+  'archivo black': { stack: 'Archivo, Impact, sans-serif', weight: 900 },
+  'bebas neue': { stack: '"Bebas Neue", "Arial Narrow", Impact, sans-serif', weight: 400 },
+  'lilita one': { stack: '"Lilita One", Archivo, Impact, sans-serif', weight: 400 },
+  'passion one': { stack: '"Passion One", Archivo, Impact, sans-serif', weight: 700 },
+}
+
+/** Registry keys arrive as slugs or display names; normalise both. */
+function fontLook(key: string | null | undefined): { stack: string; weight: number } {
+  const normalised = (key ?? '').trim().toLowerCase().replace(/[_-]+/g, ' ')
+  return FONT_LOOKS[normalised] ?? { stack: 'Archivo, system-ui, sans-serif', weight: 700 }
+}
+
+/**
+ * The live caption preview and the gesture layer over it.
+ *
+ * Everything visual is read straight from the server's `effective_caption`
+ * (contract §8.1) — this component resolves nothing. Geometry is per clip now:
+ * a drag releases `caption_x_ratio` + `caption_margin_ratio` together, and a
+ * release near the middle reports `null`, which the renderer reads as centred.
+ * The resize handle keeps its old gesture but reports a `size_ratio` override.
+ */
 function CaptionOverlay({
   words,
   time,
-  style,
-  sizeScale,
-  onGeometry,
+  caption,
+  geometry,
+  overrides,
+  frame,
+  onPosition,
+  onSize,
 }: {
   words: Word[]
   time: number
-  style: CaptionStyle | undefined
-  sizeScale: number
-  onGeometry?: (patch: { sizeScale?: number; positionRatio?: number | null }) => void
+  caption: EffectiveCaption | null
+  geometry?: { xRatio: number | null; marginRatio: number | null }
+  overrides?: StyleOverrides | null
+  frame: React.MutableRefObject<HTMLDivElement | null>
+  onPosition?: (patch: { xRatio: number | null; marginRatio: number | null }) => void
+  onSize?: (sizeRatio: number) => void
 }) {
-  const boxRef = useRef<HTMLDivElement>(null)
   const movedRef = useRef(false)
-  const [move, setMove] = useState<{ startY: number; startMargin: number } | null>(null)
-  const [dyPct, setDyPct] = useState(0)
-  const [resizing, setResizing] = useState<{ startY: number } | null>(null)
-  const [scaleFactor, setScaleFactor] = useState(1)
+  const [drag, setDrag] = useState<{
+    originX: number
+    originY: number
+    startX: number
+    startMargin: number
+  } | null>(null)
+  const [offset, setOffset] = useState({ x: 0, y: 0 })
+  const [resize, setResize] = useState<{ startY: number; base: number } | null>(null)
+  const [scale, setScale] = useState(1)
 
-  if (!style || words.length === 0) return null
+  if (!caption || words.length === 0) return null
 
-  const groups = groupWords(words, style.preview.maxWords)
+  const groups = groupWords(words, caption.maxWords ?? DEFAULT_MAX_WORDS)
   const active = groups.find((group) => time >= group[0].start && time <= group[group.length - 1].end)
   if (!active) return null
 
-  const { primary, accent, allCaps, outlineWidth, boxed, marginRatio, sizeRatio } = style.preview
-  const margin = move ? move.startMargin - dyPct : marginRatio * 100
+  // Resolution order mirrors the server's, highest wins, and the snapshot is
+  // already the result of it — the stored per-clip values are only a backstop
+  // for a payload that predates effective_caption.
+  const restingMargin = clamp(
+    caption.margin_ratio ?? caption.marginRatio ?? geometry?.marginRatio ?? DEFAULT_MARGIN_RATIO,
+    MARGIN_MIN,
+    MARGIN_MAX,
+  )
 
-  const boxHeight = () => boxRef.current?.parentElement?.getBoundingClientRect().height ?? 1
+  // The anchor is normally in the payload as x_ratio. If only the alignment came
+  // back (a preset layout x with a null clip x), the exact anchor is unknowable
+  // here, so it is approximated on the side the renderer will use rather than
+  // being re-centred — centring would be the bigger lie of the two.
+  const storedX = geometry?.xRatio ?? null
+  const reportedX = caption.x_ratio ?? storedX
+  const restingX =
+    reportedX != null
+      ? clamp(reportedX, 0, 1)
+      : caption.alignment === 'left'
+        ? ANCHOR_FALLBACK
+        : caption.alignment === 'right'
+          ? 1 - ANCHOR_FALLBACK
+          : 0.5
 
-  const beginMove = (clientY: number) => {
-    if (!onGeometry) return
+  const liveX = drag ? clamp(drag.startX + offset.x, 0, 1) : restingX
+  const liveMargin = drag ? clamp(drag.startMargin - offset.y, MARGIN_MIN, MARGIN_MAX) : restingMargin
+  // Magnetic: inside the window the caption sits on the centre line, which is
+  // exactly where releasing there will put it.
+  const snapped = drag !== null && Math.abs(liveX - 0.5) <= CENTRE_SNAP
+  const x = snapped ? 0.5 : liveX
+  const alignment = alignmentFor(x)
+
+  const baseSize = clamp(caption.sizeRatio ?? 0.05, SIZE_MIN, SIZE_MAX)
+  const size = resize ? clamp(resize.base * scale, SIZE_MIN, SIZE_MAX) : baseSize
+  const look = fontLook(caption.font)
+  const animation = caption.animation ?? 'scale'
+  const boxed = Boolean(caption.boxed)
+  const outlineWidth = caption.outlineWidth ?? 0
+  const outline = caption.outline ?? '#000000'
+  const primary = caption.primary ?? '#ffffff'
+  // The snapshot does not carry the box colours yet, so the stored override is
+  // the best available source; the renderer's own default is a near-opaque box.
+  const boxColour = caption.box_colour ?? overrides?.box_colour ?? '#000000'
+  const boxAlpha = caption.box_alpha ?? overrides?.box_alpha ?? 40
+
+  const frameBox = () => frame.current?.getBoundingClientRect() ?? null
+
+  const beginDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!onPosition || resize) return
+    event.currentTarget.setPointerCapture(event.pointerId)
     movedRef.current = false
-    setDyPct(0)
-    setMove({ startY: clientY, startMargin: marginRatio * 100 })
+    setOffset({ x: 0, y: 0 })
+    setDrag({
+      originX: event.clientX,
+      originY: event.clientY,
+      startX: restingX,
+      startMargin: restingMargin,
+    })
   }
 
-  const trackMove = (clientY: number) => {
-    if (!move) return
-    const pct = ((clientY - move.startY) / boxHeight()) * 100
-    if (Math.abs(clientY - move.startY) > 4) movedRef.current = true
-    setDyPct(pct)
+  const trackDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!drag || resize) return
+    const box = frameBox()
+    if (!box || box.width === 0 || box.height === 0) return
+    const dx = event.clientX - drag.originX
+    const dy = event.clientY - drag.originY
+    if (Math.abs(dx) > 4 || Math.abs(dy) > 4) movedRef.current = true
+    setOffset({ x: dx / box.width, y: dy / box.height })
   }
 
-  const endMove = () => {
-    if (!move) return
-    const ratio = Math.min(80, Math.max(0, move.startMargin - dyPct)) / 100
-    setMove(null)
-    setDyPct(0)
-    if (movedRef.current) onGeometry?.({ positionRatio: Math.round(ratio * 1000) / 1000 })
+  const endDrag = () => {
+    if (!drag) return
+    const moved = movedRef.current
+    const nextX = Math.abs(liveX - 0.5) <= CENTRE_SNAP ? null : Math.round(liveX * 1000) / 1000
+    const nextMargin = Math.round(liveMargin * 1000) / 1000
+    setDrag(null)
+    setOffset({ x: 0, y: 0 })
+    if (!moved) return
+    const xChanged = nextX === null ? restingX !== 0.5 : Math.abs(nextX - restingX) > 0.001
+    if (!xChanged && Math.abs(nextMargin - restingMargin) < 0.005) return
+    onPosition?.({ xRatio: nextX, marginRatio: nextMargin })
   }
 
   const endResize = () => {
-    if (!resizing) return
-    setResizing(null)
-    const next = Math.min(2, Math.max(0.5, sizeScale * scaleFactor))
-    setScaleFactor(1)
-    if (Math.abs(next - sizeScale) > 0.005) {
-      onGeometry?.({ sizeScale: Math.round(next * 100) / 100 })
-    }
+    if (!resize) return
+    const next = Math.round(clamp(resize.base * scale, SIZE_MIN, SIZE_MAX) * 10000) / 10000
+    setResize(null)
+    setScale(1)
+    if (movedRef.current && Math.abs(next - resize.base) > 0.0005) onSize?.(next)
   }
 
   // Shared by the overlay (move release) and the resize handle, which captures
   // the pointer so its own release never bubbles to the overlay.
   const releasePointer = () => {
-    if (resizing) endResize()
-    else endMove()
+    if (resize) endResize()
+    else endDrag()
   }
 
   return (
-    <div
-      ref={boxRef}
-      className="pointer-events-auto absolute inset-x-0 flex touch-none justify-center px-[6%] select-none"
-      style={{ bottom: `${margin}%`, cursor: onGeometry ? 'move' : undefined }}
-      title={onGeometry ? 'Drag to move · corner handle resizes · double-click resets' : undefined}
-      onPointerDown={(e) => {
-        if (resizing) return
-        e.currentTarget.setPointerCapture(e.pointerId)
-        beginMove(e.clientY)
-      }}
-      onPointerMove={(e) => {
-        if (move && !resizing) trackMove(e.clientY)
-        if (resizing) {
-          const factor = 1 + (e.clientY - resizing.startY) / 250
-          if (Math.abs(e.clientY - resizing.startY) > 4) movedRef.current = true
-          setScaleFactor(Math.min(2.2, Math.max(0.4, factor)))
-        }
-      }}
-      onPointerUp={releasePointer}
-      onPointerCancel={() => {
-        setMove(null)
-        setDyPct(0)
-        setResizing(null)
-        setScaleFactor(1)
-      }}
-      onClickCapture={(e) => {
-        if (movedRef.current) {
-          e.stopPropagation()
-          movedRef.current = false
-        }
-      }}
-      onDoubleClick={(e) => {
-        e.stopPropagation()
-        onGeometry?.({ positionRatio: null })
-      }}
-    >
-      <p
-        className="relative text-center leading-[1.15]"
+    <>
+      {/* Centre guide: faint while approaching, solid once the release would
+          snap. It only exists while dragging, so it never dresses the preview. */}
+      {drag && (
+        <div
+          aria-hidden
+          className={[
+            'pointer-events-none absolute inset-y-0 left-1/2 w-px -translate-x-1/2 transition-opacity duration-150',
+            snapped ? 'bg-sodium-500 opacity-100' : 'bg-ink-100/40 opacity-50',
+          ].join(' ')}
+        />
+      )}
+
+      <div
+        className="pointer-events-auto absolute inset-x-0 touch-none select-none"
         style={{
-          fontFamily: style.preview.font === 'Anton' ? 'Anton, Impact, sans-serif' : undefined,
-          fontSize: `clamp(0.75rem, ${sizeRatio * 100}cqh, 4rem)`,
-          fontWeight: boxed || style.preview.font === 'Anton' ? 400 : 600,
-          textTransform: allCaps ? 'uppercase' : 'none',
-          color: primary,
-          textShadow: boxed
-            ? undefined
-            : `0 0 ${outlineWidth}px #000, 0 0 ${outlineWidth * 2}px #000`,
-          background: boxed ? 'rgba(0,0,0,0.78)' : undefined,
-          padding: boxed ? '0.15em 0.4em' : undefined,
-          transform: scaleFactor !== 1 ? `scale(${scaleFactor})` : undefined,
-          transformOrigin: 'bottom center',
+          bottom: `${liveMargin * 100}%`,
+          // Contract §2's CSS mirror: edge-anchored text with an inset of the
+          // same fraction the renderer turns into MarginL/MarginR. No inset at
+          // the centre, because BOTTOM_CENTER carries no margins.
+          paddingLeft: alignment === 'left' ? `${x * 100}%` : undefined,
+          paddingRight: alignment === 'right' ? `${(1 - x) * 100}%` : undefined,
+          textAlign: alignment,
+          cursor: onPosition ? 'move' : undefined,
+        }}
+        title={
+          onPosition
+            ? 'Drag to place · corner handle resizes · double-click re-centres'
+            : undefined
+        }
+        onPointerDown={beginDrag}
+        onPointerMove={trackDrag}
+        onPointerUp={releasePointer}
+        onPointerCancel={() => {
+          setDrag(null)
+          setOffset({ x: 0, y: 0 })
+          setResize(null)
+          setScale(1)
+        }}
+        onClickCapture={(e) => {
+          if (movedRef.current) {
+            e.stopPropagation()
+            movedRef.current = false
+          }
+        }}
+        onDoubleClick={(e) => {
+          e.stopPropagation()
+          onPosition?.({ xRatio: null, marginRatio: null })
         }}
       >
-        {active.map((word, index) => {
-          const isActive = time >= word.start && time <= word.end
-          return (
-            <span
-              key={`${word.start}-${index}`}
-              style={{
-                color: isActive && accent ? accent : undefined,
-                display: 'inline-block',
-                transform: isActive && accent ? 'scale(1.08)' : undefined,
-                transition: 'transform 120ms cubic-bezier(0.16,1,0.3,1)',
-                marginInline: '0.14em',
-              }}
-            >
-              {allCaps ? word.text.toUpperCase() : word.text}
-            </span>
-          )
-        })}
-        {onGeometry && (
+        <p
+          // Inline-block so the caption box hugs the text like libass draws it,
+          // instead of painting a full-width band. Anchoring is unaffected: the
+          // overlay's own padding and text-align place the line boxes (§2).
+          // max-w-full keeps an oversized group wrapping at the frame edge; a
+          // group long enough to wrap gets a full-width box, which is the closest
+          // a single block background can get to libass's per-line rectangle.
+          className="relative inline-block max-w-full leading-[1.15]"
+          style={{
+            fontFamily: look.stack,
+            // cqh is this frame's height (the preview box declares size
+            // containment), so the ratio is the renderer's ratio.
+            fontSize: `${(size * 100).toFixed(2)}cqh`,
+            fontWeight: look.weight,
+            textTransform: caption.allCaps ? 'uppercase' : 'none',
+            color: primary,
+            textShadow: boxed
+              ? undefined
+              : `0 0 ${outlineWidth}px ${outline}, 0 0 ${outlineWidth * 2}px ${outline}`,
+            background: boxed
+              ? (withAssAlpha(boxColour, boxAlpha) ?? 'rgba(0, 0, 0, 0.78)')
+              : undefined,
+            padding: boxed ? '0.15em 0.4em' : undefined,
+          }}
+        >
+          {active.map((word, index) => {
+            const isActive = time >= word.start && time <= word.end
+            // `none` is a static caption: no per-word colour, no pop. A null
+            // accent disables the highlight the same way (contract §1).
+            const highlighted = animation !== 'none' && isActive && Boolean(caption.accent)
+            const pops = highlighted && animation === 'scale'
+            return (
+              <span
+                key={`${word.start}-${index}`}
+                style={{
+                  color: highlighted ? (caption.accent ?? undefined) : undefined,
+                  display: 'inline-block',
+                  transform: pops ? 'scale(1.08)' : undefined,
+                  transition:
+                    animation === 'none'
+                      ? undefined
+                      : 'transform 120ms cubic-bezier(0.16, 1, 0.3, 1), color 120ms linear',
+                  marginInline: '0.14em',
+                }}
+              >
+                {caption.allCaps ? word.text.toUpperCase() : word.text}
+              </span>
+            )
+          })}
+        </p>
+
+        {/* Chrome, not content: it hangs off the overlay rather than the text so
+            it stays inside the frame even when the caption spans the full width
+            (centred has no margins, and the frame clips its overflow). */}
+        {onSize && (
           <span
             role="button"
             aria-label="Resize captions"
-            title="Drag to resize"
-            className="absolute -right-3 -bottom-2 size-4 cursor-nwse-resize rounded-[3px] border border-sodium-500/80 bg-ink-900/80"
+            title={`Drag to resize — ${(baseSize * 100).toFixed(1)}% of frame height`}
+            className="absolute right-0 bottom-0 size-4 cursor-nwse-resize rounded-[3px] border border-sodium-500/80 bg-ink-900/80"
             onPointerDown={(e) => {
               e.stopPropagation()
               e.currentTarget.setPointerCapture(e.pointerId)
               movedRef.current = false
-              setScaleFactor(1)
-              setResizing({ startY: e.clientY })
+              setScale(1)
+              setResize({ startY: e.clientY, base: baseSize })
+            }}
+            onPointerMove={(e) => {
+              if (!resize) return
+              const dy = e.clientY - resize.startY
+              if (Math.abs(dy) > 4) movedRef.current = true
+              setScale(clamp(1 + dy / 250, 0.2, 3))
             }}
             onPointerUp={(e) => {
               e.stopPropagation()
@@ -776,8 +990,8 @@ function CaptionOverlay({
             onDoubleClick={(e) => e.stopPropagation()}
           />
         )}
-      </p>
-    </div>
+      </div>
+    </>
   )
 }
 

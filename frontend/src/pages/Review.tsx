@@ -3,21 +3,36 @@ import { Link, useParams } from 'react-router-dom'
 
 import {
   api,
+  captionForClip,
   formatBytes,
   formatDuration,
   type CaptionStyle,
   type Clip,
   type CropPath,
   type FacecamBox,
+  type FontEntry,
   type Job,
+  type Preset,
+  type StyleOverrides,
   type Word,
 } from '../api'
 import { CaptionEditor } from '../components/CaptionEditor'
 import { ClipPlayer } from '../components/ClipPlayer'
 import { ErrorNote } from '../components/ErrorNote'
+import { StylePanel } from '../components/StylePanel'
+import { TabBar } from '../components/TabBar'
 import { TrimBar } from '../components/TrimBar'
 
 const RATIOS = ['9:16', '1:1', '16:9'] as const
+
+type ReviewTab = 'style' | 'framing' | 'webcam'
+
+/** Tab state is local to this page — the player and trim bar never move. */
+const TABS: { id: ReviewTab; label: string }[] = [
+  { id: 'style', label: 'Style' },
+  { id: 'framing', label: 'Framing' },
+  { id: 'webcam', label: 'Webcam' },
+]
 
 export function Review() {
   const { jobId } = useParams()
@@ -31,17 +46,28 @@ export function Review() {
   const [savingWords, setSavingWords] = useState(false)
   const [exporting, setExporting] = useState<Set<string>>(new Set())
   const [error, setError] = useState<Error | null>(null)
-  // Global caption geometry backing the preview overlay's drag-to-move and
-  // resize handle. The overlay edits these; Settings shows the same values.
-  const [captionCfg, setCaptionCfg] = useState<{
-    sizeScale: number
-    positionRatio: number | null
-  } | null>(null)
+  const [tab, setTab] = useState<ReviewTab>('style')
+  // Font registry and presets belong to the backend lane: until it merges these
+  // endpoints 404, and the controls dim rather than taking the page down.
+  const [fonts, setFonts] = useState<FontEntry[]>([])
+  const [fontsUnavailable, setFontsUnavailable] = useState(false)
+  const [presets, setPresets] = useState<Preset[]>([])
+  const [presetsUnavailable, setPresetsUnavailable] = useState(false)
   // Local slider draft so dragging doesn't PATCH per tick; commits on release.
   const [nudgeDraft, setNudgeDraft] = useState<number | null>(null)
   const [facecam, setFacecam] = useState<FacecamBox | null>(null)
   const [detecting, setDetecting] = useState(false)
   const [pipSizeDraft, setPipSizeDraft] = useState<number | null>(null)
+
+  const loadPresets = useCallback(async () => {
+    try {
+      setPresets(await api.listPresets())
+      setPresetsUnavailable(false)
+    } catch {
+      setPresets([])
+      setPresetsUnavailable(true)
+    }
+  }, [])
 
   useEffect(() => {
     if (!jobId) return
@@ -53,20 +79,29 @@ export function Review() {
         setSelectedId((current) => current ?? loadedClips[0]?.id ?? null)
       })
       .catch((err) => setError(err as Error))
-    void api
-      .getSettings()
-      .then((settings) =>
-        setCaptionCfg({
-          sizeScale: settings.export.caption_size_scale,
-          positionRatio: settings.export.caption_position_ratio,
-        }),
-      )
-      .catch(() => undefined)
   }, [jobId])
+
+  useEffect(() => {
+    void api
+      .fonts()
+      .then((loaded) => {
+        setFonts(loaded)
+        setFontsUnavailable(false)
+      })
+      .catch(() => setFontsUnavailable(true))
+    void loadPresets()
+  }, [loadPresets])
 
   const selected = useMemo(
     () => clips.find((clip) => clip.id === selectedId) ?? null,
     [clips, selectedId],
+  )
+
+  // The preview renders the server's resolved snapshot; the fallback inside
+  // captionForClip only covers a backend that predates the field.
+  const effective = useMemo(
+    () => (selected ? captionForClip(selected, styles) : null),
+    [selected, styles],
   )
 
   useEffect(() => {
@@ -185,28 +220,82 @@ export function Review() {
     }
   }
 
-  const commitCaptionGeometry = async (patch: {
-    sizeScale?: number
-    positionRatio?: number | null
-  }) => {
-    if (!captionCfg) return
+  /**
+   * Style edits always send the whole overrides blob — the PATCH replaces it
+   * wholesale (contract §3). Spreading the clip's own overrides first keeps
+   * every untouched field inheriting from the base preset instead of being
+   * frozen to whatever the resolved value happened to be.
+   */
+  const commitOverrides = async (clip: Clip, patch: Partial<StyleOverrides>) => {
+    const next: StyleOverrides = { ...(clip.style_overrides ?? {}), ...patch }
     try {
-      const next = {
-        sizeScale: patch.sizeScale ?? captionCfg.sizeScale,
-        positionRatio:
-          patch.positionRatio !== undefined ? patch.positionRatio : captionCfg.positionRatio,
-      }
-      const settings = await api.putSettings({
-        export: {
-          caption_size_scale: next.sizeScale,
-          caption_position_ratio: next.positionRatio,
+      patchClip(await api.patchCaptions(clip.id, { style_overrides: next }))
+    } catch (err) {
+      setError(err as Error)
+    }
+  }
+
+  /** Caption drag release: both per-clip geometry ratios at once (contract §2). */
+  const commitCaptionPosition = async (
+    clip: Clip,
+    patch: { xRatio: number | null; marginRatio: number | null },
+  ) => {
+    try {
+      patchClip(
+        await api.patchCaptions(clip.id, {
+          caption_x_ratio: patch.xRatio,
+          caption_margin_ratio: patch.marginRatio,
+        }),
+      )
+    } catch (err) {
+      setError(err as Error)
+    }
+  }
+
+  /** Resize release — a size_ratio override on this clip, nothing global. */
+  const commitCaptionSize = async (clip: Clip, sizeRatio: number) => {
+    await commitOverrides(clip, { size_ratio: sizeRatio })
+  }
+
+  const applyPreset = async (clip: Clip, presetId: string) => {
+    try {
+      patchClip(await api.applyPreset(presetId, clip.id))
+    } catch (err) {
+      setError(err as Error)
+    }
+  }
+
+  /** Saving captures the clip as it stands — look and layout (contract §4). */
+  const savePreset = async (clip: Clip, name: string) => {
+    try {
+      await api.createPreset({
+        name,
+        base_style: clip.caption_style,
+        style_overrides: clip.style_overrides ?? null,
+        layout: {
+          caption_margin_ratio: clip.caption_margin_ratio ?? null,
+          caption_x_ratio: clip.caption_x_ratio ?? null,
         },
       })
-      setCaptionCfg({
-        sizeScale: settings.export.caption_size_scale,
-        positionRatio: settings.export.caption_position_ratio,
-      })
-      setStyles(await api.captionStyles())
+      await loadPresets()
+    } catch (err) {
+      setError(err as Error)
+    }
+  }
+
+  const setDefaultPreset = async (presetId: string) => {
+    try {
+      await api.setDefaultPreset(presetId)
+      await loadPresets()
+    } catch (err) {
+      setError(err as Error)
+    }
+  }
+
+  const deletePreset = async (presetId: string) => {
+    try {
+      await api.deletePreset(presetId)
+      await loadPresets()
     } catch (err) {
       setError(err as Error)
     }
@@ -239,7 +328,6 @@ export function Review() {
   }
 
   const keptCount = clips.filter((clip) => clip.status === 'kept').length
-  const activeStyle = styles.find((style) => style.key === selected?.caption_style)
 
   if (error && clips.length === 0) {
     return (
@@ -315,13 +403,18 @@ export function Review() {
                   startS={selected.start_s}
                   endS={selected.end_s}
                   words={words}
-                  style={activeStyle}
                   ratio={selected.ratio}
                   cropPath={cropPath}
                   cropNudge={selected.crop_nudge}
                   centreCrop={selected.centre_crop}
-                  captionSizeScale={captionCfg?.sizeScale ?? 1}
-                  onCaptionGeometry={commitCaptionGeometry}
+                  caption={effective}
+                  captionOverrides={selected.style_overrides ?? null}
+                  captionGeometry={{
+                    xRatio: selected.caption_x_ratio ?? null,
+                    marginRatio: selected.caption_margin_ratio ?? null,
+                  }}
+                  onCaptionPosition={(patch) => void commitCaptionPosition(selected, patch)}
+                  onCaptionSize={(size) => void commitCaptionSize(selected, size)}
                   pip={
                     selected.pip_enabled && facecam
                       ? {
@@ -375,196 +468,203 @@ export function Review() {
                 />
 
                 <div>
-                  <p className="eyebrow border-b border-ink-800 pb-2">Caption style</p>
-                  <div className="mt-3 space-y-1">
-                    {styles.map((style) => (
-                      <button
-                        key={style.key}
-                        onClick={() => setStyle(selected, style.key)}
-                        className={[
-                          'block w-full border-l-2 py-2 pl-3 text-left transition-colors duration-200',
-                          style.key === selected.caption_style
-                            ? 'border-sodium-500 bg-ink-850/60'
-                            : 'border-transparent hover:border-ink-700 hover:bg-ink-850/30',
-                        ].join(' ')}
-                      >
-                        <span className="text-sm text-ink-100">{style.label}</span>
-                        <span className="mt-0.5 block text-xs leading-snug text-ink-500">
-                          {style.description}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
+                  <TabBar tabs={TABS} value={tab} onChange={setTab} />
 
-                <div>
-                  <p className="eyebrow border-b border-ink-800 pb-2">Aspect ratio</p>
-                  <div className="mt-3 flex gap-2">
-                    {RATIOS.map((ratio) => (
-                      <button
-                        key={ratio}
-                        onClick={() => setRatio(selected, ratio)}
-                        className={[
-                          'numeric btn',
-                          ratio === selected.ratio ? 'btn-primary' : 'btn-ghost',
-                        ].join(' ')}
-                      >
-                        {ratio}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div>
-                  <div className="flex items-baseline justify-between border-b border-ink-800 pb-2">
-                    <p className="eyebrow">Framing</p>
-                    <span className="numeric text-xs text-ink-500">
-                      {(nudgeDraft ?? selected.crop_nudge * 100) > 0 ? '+' : ''}
-                      {Math.round(nudgeDraft ?? selected.crop_nudge * 100)}%
-                    </span>
-                  </div>
-                  <input
-                    type="range"
-                    min={-100}
-                    max={100}
-                    step={1}
-                    value={Math.round(nudgeDraft ?? selected.crop_nudge * 100)}
-                    disabled={selected.centre_crop}
-                    onChange={(e) => setNudgeDraft(Number(e.target.value))}
-                    onPointerUp={(e) => commitNudge(selected, Number(e.currentTarget.value))}
-                    onKeyUp={(e) => {
-                      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
-                        commitNudge(selected, Number(e.currentTarget.value))
-                      }
-                    }}
-                    aria-label="Shift crop window left or right"
-                    className="mt-3 h-1 w-full cursor-pointer appearance-none rounded-full bg-ink-700 accent-sodium-500 disabled:opacity-40"
-                  />
-                  <div className="mt-1 flex justify-between text-[0.6875rem] text-ink-600">
-                    <span>← left</span>
-                    <span>auto-tracked</span>
-                    <span>right →</span>
-                  </div>
-                  <div className="mt-2 flex items-center justify-between gap-3">
-                    <label className="flex items-center gap-2 text-xs text-ink-300">
-                      <input
-                        type="checkbox"
-                        checked={selected.centre_crop}
-                        onChange={(e) => setCentreCrop(selected, e.target.checked)}
-                        className="size-3.5 accent-sodium-500"
+                  {/* All three panels stay mounted and hide with display:none,
+                      so switching tabs cannot lose a gesture draft and the
+                      framing and webcam blocks move under them unchanged. */}
+                  <div className="mt-6">
+                    <div className={tab === 'style' ? undefined : 'hidden'}>
+                      <StylePanel
+                        clip={selected}
+                        styles={styles}
+                        fonts={fonts}
+                        fontsUnavailable={fontsUnavailable}
+                        effective={effective}
+                        presets={presets}
+                        presetsUnavailable={presetsUnavailable}
+                        onBaseStyle={(key) => void setStyle(selected, key)}
+                        onOverride={(patch) => void commitOverrides(selected, patch)}
+                        onApplyPreset={(id) => applyPreset(selected, id)}
+                        onSavePreset={(name) => savePreset(selected, name)}
+                        onSetDefaultPreset={setDefaultPreset}
+                        onDeletePreset={deletePreset}
                       />
-                      Lock to center
-                    </label>
-                    {selected.crop_nudge !== 0 && !selected.centre_crop && (
-                      <button
-                        onClick={() => commitNudge(selected, 0)}
-                        className="btn btn-quiet text-xs"
-                      >
-                        Reset
-                      </button>
-                    )}
-                  </div>
-                  <p className="mt-1.5 text-xs leading-snug text-ink-500">
-                    Shifts the tracked window on the next export. The preview above moves
-                    with the slider.
-                  </p>
-                </div>
-
-                <div>
-                  <div className="flex items-baseline justify-between border-b border-ink-800 pb-2">
-                    <p className="eyebrow">Picture-in-picture</p>
-                    {facecam && (
-                      <span className="numeric text-xs text-ink-500">
-                        facecam {facecam.corner.toUpperCase()} ·{' '}
-                        {Math.round(facecam.coverage * 100)}%
-                      </span>
-                    )}
-                  </div>
-                  <label className="mt-3 flex items-center gap-2 text-sm text-ink-200">
-                    <input
-                      type="checkbox"
-                      checked={selected.pip_enabled}
-                      onChange={(e) =>
-                        setPip(selected, { pip_enabled: e.target.checked })
-                      }
-                      className="size-4 accent-sodium-500"
-                    />
-                    Facecam inset over full screen
-                  </label>
-                  {selected.pip_enabled && (
-                    <div className="mt-3 space-y-3">
-                      {!facecam ? (
-                        <button
-                          onClick={() => detectFacecam(selected)}
-                          disabled={detecting}
-                          className="btn btn-ghost w-full"
-                        >
-                          {detecting ? 'Scanning for facecam…' : 'Detect facecam'}
-                        </button>
-                      ) : (
-                        <>
-                          <div className="flex gap-2">
-                            {['auto', 'tl', 'tr', 'bl', 'br'].map((corner) => (
-                              <button
-                                key={corner}
-                                onClick={() => setPip(selected, { pip_corner: corner })}
-                                className={[
-                                  'btn flex-1',
-                                  selected.pip_corner === corner
-                                    ? 'btn-primary'
-                                    : 'btn-ghost',
-                                ].join(' ')}
-                              >
-                                {corner === 'auto' ? 'Auto' : corner.toUpperCase()}
-                              </button>
-                            ))}
-                          </div>
-                          <div>
-                            <div className="flex items-baseline justify-between">
-                              <span className="text-xs text-ink-400">Inset size</span>
-                              <span className="numeric text-xs text-ink-500">
-                                {Math.round(
-                                  (pipSizeDraft ?? selected.pip_size * 100),
-                                )}
-                                %
-                              </span>
-                            </div>
-                            <input
-                              type="range"
-                              min={20}
-                              max={60}
-                              step={1}
-                              value={Math.round(pipSizeDraft ?? selected.pip_size * 100)}
-                              onChange={(e) => setPipSizeDraft(Number(e.target.value))}
-                              onPointerUp={(e) => {
-                                const size = Number(e.currentTarget.value) / 100
-                                setPipSizeDraft(null)
-                                if (Math.abs(size - selected.pip_size) > 0.005) {
-                                  setPip(selected, { pip_size: size })
-                                }
-                              }}
-                              aria-label="Facecam inset size"
-                              className="mt-2 h-1 w-full cursor-pointer appearance-none rounded-full bg-ink-700 accent-sodium-500"
-                            />
-                          </div>
-                          <button
-                            onClick={() => detectFacecam(selected)}
-                            disabled={detecting}
-                            className="btn btn-quiet text-xs"
-                          >
-                            {detecting ? 'Scanning…' : 'Re-detect facecam'}
-                          </button>
-                        </>
-                      )}
-                      <p className="text-xs leading-snug text-ink-500">
-                        {facecam
-                          ? 'Inset follows the detected facecam; corner and size apply on export.'
-                          : 'Scans this clip for a persistent corner face (about a minute per minute of clip).'}
-                      </p>
                     </div>
-                  )}
-                </div>
 
+                    <div className={tab === 'framing' ? 'space-y-10' : 'hidden'}>
+                      <div>
+                        <p className="eyebrow border-b border-ink-800 pb-2">Aspect ratio</p>
+                        <div className="mt-3 flex gap-2">
+                          {RATIOS.map((ratio) => (
+                            <button
+                              key={ratio}
+                              onClick={() => setRatio(selected, ratio)}
+                              className={[
+                                'numeric btn',
+                                ratio === selected.ratio ? 'btn-primary' : 'btn-ghost',
+                              ].join(' ')}
+                            >
+                              {ratio}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div>
+                        <div className="flex items-baseline justify-between border-b border-ink-800 pb-2">
+                          <p className="eyebrow">Framing</p>
+                          <span className="numeric text-xs text-ink-500">
+                            {(nudgeDraft ?? selected.crop_nudge * 100) > 0 ? '+' : ''}
+                            {Math.round(nudgeDraft ?? selected.crop_nudge * 100)}%
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={-100}
+                          max={100}
+                          step={1}
+                          value={Math.round(nudgeDraft ?? selected.crop_nudge * 100)}
+                          disabled={selected.centre_crop}
+                          onChange={(e) => setNudgeDraft(Number(e.target.value))}
+                          onPointerUp={(e) => commitNudge(selected, Number(e.currentTarget.value))}
+                          onKeyUp={(e) => {
+                            if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+                              commitNudge(selected, Number(e.currentTarget.value))
+                            }
+                          }}
+                          aria-label="Shift crop window left or right"
+                          className="mt-3 h-1 w-full cursor-pointer appearance-none rounded-full bg-ink-700 accent-sodium-500 disabled:opacity-40"
+                        />
+                        <div className="mt-1 flex justify-between text-[0.6875rem] text-ink-600">
+                          <span>← left</span>
+                          <span>auto-tracked</span>
+                          <span>right →</span>
+                        </div>
+                        <div className="mt-2 flex items-center justify-between gap-3">
+                          <label className="flex items-center gap-2 text-xs text-ink-300">
+                            <input
+                              type="checkbox"
+                              checked={selected.centre_crop}
+                              onChange={(e) => setCentreCrop(selected, e.target.checked)}
+                              className="size-3.5 accent-sodium-500"
+                            />
+                            Lock to center
+                          </label>
+                          {selected.crop_nudge !== 0 && !selected.centre_crop && (
+                            <button
+                              onClick={() => commitNudge(selected, 0)}
+                              className="btn btn-quiet text-xs"
+                            >
+                              Reset
+                            </button>
+                          )}
+                        </div>
+                        <p className="mt-1.5 text-xs leading-snug text-ink-500">
+                          Shifts the tracked window on the next export. The preview above moves
+                          with the slider.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className={tab === 'webcam' ? undefined : 'hidden'}>
+                      <div>
+                        <div className="flex items-baseline justify-between border-b border-ink-800 pb-2">
+                          <p className="eyebrow">Picture-in-picture</p>
+                          {facecam && (
+                            <span className="numeric text-xs text-ink-500">
+                              facecam {facecam.corner.toUpperCase()} ·{' '}
+                              {Math.round(facecam.coverage * 100)}%
+                            </span>
+                          )}
+                        </div>
+                        <label className="mt-3 flex items-center gap-2 text-sm text-ink-200">
+                          <input
+                            type="checkbox"
+                            checked={selected.pip_enabled}
+                            onChange={(e) =>
+                              setPip(selected, { pip_enabled: e.target.checked })
+                            }
+                            className="size-4 accent-sodium-500"
+                          />
+                          Facecam inset over full screen
+                        </label>
+                        {selected.pip_enabled && (
+                          <div className="mt-3 space-y-3">
+                            {!facecam ? (
+                              <button
+                                onClick={() => detectFacecam(selected)}
+                                disabled={detecting}
+                                className="btn btn-ghost w-full"
+                              >
+                                {detecting ? 'Scanning for facecam…' : 'Detect facecam'}
+                              </button>
+                            ) : (
+                              <>
+                                <div className="flex gap-2">
+                                  {['auto', 'tl', 'tr', 'bl', 'br'].map((corner) => (
+                                    <button
+                                      key={corner}
+                                      onClick={() => setPip(selected, { pip_corner: corner })}
+                                      className={[
+                                        'btn flex-1',
+                                        selected.pip_corner === corner
+                                          ? 'btn-primary'
+                                          : 'btn-ghost',
+                                      ].join(' ')}
+                                    >
+                                      {corner === 'auto' ? 'Auto' : corner.toUpperCase()}
+                                    </button>
+                                  ))}
+                                </div>
+                                <div>
+                                  <div className="flex items-baseline justify-between">
+                                    <span className="text-xs text-ink-400">Inset size</span>
+                                    <span className="numeric text-xs text-ink-500">
+                                      {Math.round(
+                                        (pipSizeDraft ?? selected.pip_size * 100),
+                                      )}
+                                      %
+                                    </span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min={20}
+                                    max={60}
+                                    step={1}
+                                    value={Math.round(pipSizeDraft ?? selected.pip_size * 100)}
+                                    onChange={(e) => setPipSizeDraft(Number(e.target.value))}
+                                    onPointerUp={(e) => {
+                                      const size = Number(e.currentTarget.value) / 100
+                                      setPipSizeDraft(null)
+                                      if (Math.abs(size - selected.pip_size) > 0.005) {
+                                        setPip(selected, { pip_size: size })
+                                      }
+                                    }}
+                                    aria-label="Facecam inset size"
+                                    className="mt-2 h-1 w-full cursor-pointer appearance-none rounded-full bg-ink-700 accent-sodium-500"
+                                  />
+                                </div>
+                                <button
+                                  onClick={() => detectFacecam(selected)}
+                                  disabled={detecting}
+                                  className="btn btn-quiet text-xs"
+                                >
+                                  {detecting ? 'Scanning…' : 'Re-detect facecam'}
+                                </button>
+                              </>
+                            )}
+                            <p className="text-xs leading-snug text-ink-500">
+                              {facecam
+                                ? 'Inset follows the detected facecam; corner and size apply on export.'
+                                : 'Scans this clip for a persistent corner face (about a minute per minute of clip).'}
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
                 <div className="border-t border-ink-800 pt-6">
                   <button
                     onClick={() => exportClip(selected)}

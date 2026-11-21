@@ -72,6 +72,14 @@ export interface Clip {
   pip_enabled: boolean
   pip_corner: string
   pip_size: number
+  /** Per-clip overrides; null inherits the base preset (contract §1). */
+  style_overrides?: StyleOverrides | null
+  /** Distance from the frame bottom, 0.0–0.8; null = the preset's default. */
+  caption_margin_ratio?: number | null
+  /** Horizontal anchor, 0.0–1.0; null = horizontally centred. */
+  caption_x_ratio?: number | null
+  /** Resolved snapshot for the preview (contract §3). */
+  effective_caption?: EffectiveCaption | null
   exports: ExportRecord[]
 }
 
@@ -115,23 +123,106 @@ export interface FacecamBox {
   coverage: number
 }
 
+export interface CaptionPreview {
+  font: string
+  primary: string
+  accent: string | null
+  outline: string
+  outlineWidth: number
+  allCaps: boolean
+  sizeRatio: number
+  marginRatio: number | null
+  boxed: boolean
+  animation: string
+  maxWords: number
+}
+
 export interface CaptionStyle {
   key: string
   label: string
   description: string
-  preview: {
-    font: string
-    primary: string
-    accent: string | null
-    outline: string
-    outlineWidth: number
-    allCaps: boolean
-    sizeRatio: number
-    marginRatio: number
-    boxed: boolean
-    animation: string
-    maxWords: number
-  }
+  preview: CaptionPreview
+}
+
+/**
+ * Per-clip style overrides — contract §1.
+ *
+ * Every field is optional: a missing one falls through to the base preset, then
+ * the legacy globals, then the built-in defaults. The PATCH replaces the whole
+ * blob, so the UI always sends it complete (contract §3).
+ */
+export interface StyleOverrides {
+  /** Registry key from GET /api/fonts; unknown keys are a 400. */
+  font?: string
+  /** Fraction of frame height, 0.02–0.12. */
+  size_ratio?: number
+  primary?: string
+  /** null disables the per-word highlight. */
+  accent?: string | null
+  outline?: string
+  /** 0.0–8.0. */
+  outline_width?: number
+  all_caps?: boolean
+  animation?: Animation
+  /** Words per caption group, 1–8 — the pacing control. */
+  max_words?: number
+  boxed?: boolean
+  box_colour?: string
+  /** ASS alpha: 0 = opaque, 255 = transparent. */
+  box_alpha?: number
+}
+
+export type Animation = 'scale' | 'karaoke' | 'none'
+
+export type CaptionAlignment = 'left' | 'center' | 'right'
+
+/**
+ * The resolved caption the server burns in, handed to the preview verbatim
+ * (contract §3). Rendering this instead of resolving locally is what keeps the
+ * preview honest (§8.1).
+ */
+export interface EffectiveCaption extends CaptionPreview {
+  /** Contract §3 spelling of `marginRatio`; both are accepted during the
+   *  transition so neither side has to guess. */
+  margin_ratio?: number | null
+  /** Horizontal anchor the resolution settled on. §3's field list does not
+   *  name it, but §2's CSS mirror needs it; `caption_x_ratio` backs it up. */
+  x_ratio?: number | null
+  /** Derived from the anchor by §2's alignment maths. */
+  alignment?: CaptionAlignment
+  box_colour?: string | null
+  box_alpha?: number | null
+}
+
+/** A font the renderer can burn in (contract §5). */
+export interface FontEntry {
+  key: string
+  label: string
+}
+
+/** A saved look-and-layout preset (contract §4). */
+export interface Preset {
+  id: string
+  name: string
+  base_style: string
+  style_overrides: StyleOverrides | null
+  layout: PresetLayout | null
+  /** SQLite integer; truthiness is the portable read. */
+  is_default: boolean | number
+  created_at?: string
+}
+
+/** `layout` on a preset — Phase 2 appends the `pip_*` placement fields here. */
+export interface PresetLayout {
+  caption_margin_ratio: number | null
+  caption_x_ratio: number | null
+}
+
+export interface PresetInput {
+  name: string
+  base_style: string
+  style_overrides?: StyleOverrides | null
+  layout?: PresetLayout | null
 }
 
 export interface ProviderStatus {
@@ -200,6 +291,30 @@ export interface JobSettingsOverrides {
   max_clips?: number
   caption_style?: string
   ratio?: string
+}
+
+/**
+ * PATCH /api/clips/{id}/captions — contract §3 merge rules.
+ *
+ * `undefined` is absent (JSON.stringify drops it) and leaves the stored value
+ * alone; an explicit `null` clears. The style blob and both geometry ratios are
+ * therefore always sent deliberately, never by default.
+ */
+export interface CaptionPatch {
+  words?: Word[]
+  caption_style?: string
+  ratio?: string
+  crop_nudge?: number
+  centre_crop?: boolean
+  pip_enabled?: boolean
+  pip_corner?: string
+  pip_size?: number
+  /** Replaces the stored blob wholesale; null clears it. */
+  style_overrides?: StyleOverrides | null
+  /** Present ⇒ set (null restores the preset default); absent ⇒ unchanged. */
+  caption_margin_ratio?: number | null
+  /** Present ⇒ set (null re-centres); absent ⇒ unchanged. */
+  caption_x_ratio?: number | null
 }
 
 /** An API error carrying the server's message and its actionable hint. */
@@ -290,19 +405,7 @@ export const api = {
     patch: { start_s?: number; end_s?: number; title?: string; status?: ClipStatus },
   ) => request<Clip>(`/api/clips/${clipId}`, { method: 'PATCH', body: JSON.stringify(patch) }),
 
-  patchCaptions: (
-    clipId: string,
-    patch: {
-      words?: Word[]
-      caption_style?: string
-      ratio?: string
-      crop_nudge?: number
-      centre_crop?: boolean
-      pip_enabled?: boolean
-      pip_corner?: string
-      pip_size?: number
-    },
-  ) =>
+  patchCaptions: (clipId: string, patch: CaptionPatch) =>
     request<Clip>(`/api/clips/${clipId}/captions`, {
       method: 'PATCH',
       body: JSON.stringify(patch),
@@ -337,6 +440,24 @@ export const api = {
     request<FacecamBox>(`/api/clips/${clipId}/facecam/detect`, { method: 'POST' }),
 
   captionStyles: () => request<CaptionStyle[]>('/api/caption-styles'),
+  fonts: () => request<FontEntry[]>('/api/fonts'),
+
+  listPresets: () => request<Preset[]>('/api/presets'),
+  createPreset: (input: PresetInput) =>
+    request<Preset>('/api/presets', { method: 'POST', body: JSON.stringify(input) }),
+  updatePreset: (id: string, input: Partial<PresetInput>) =>
+    request<Preset>(`/api/presets/${id}`, { method: 'PUT', body: JSON.stringify(input) }),
+  setDefaultPreset: (id: string) =>
+    request<Preset>(`/api/presets/${id}/default`, { method: 'PUT' }),
+  deletePreset: (id: string) => request<void>(`/api/presets/${id}`, { method: 'DELETE' }),
+
+  /** Copies a preset's look and layout onto one clip — server-side and atomic. */
+  applyPreset: (id: string, clipId: string) =>
+    request<Clip>(`/api/presets/${id}/apply`, {
+      method: 'POST',
+      body: JSON.stringify({ clip_id: clipId }),
+    }),
+
   providerStatus: () => request<ProviderStatus[]>('/api/providers/status'),
 
   getSettings: () => request<Settings>('/api/settings'),
@@ -353,6 +474,24 @@ export const api = {
     request<void>(`/api/settings/secrets/${key}`, { method: 'DELETE' }),
 
   mediaUrl: (jobId: string) => `/api/jobs/${jobId}/media`,
+}
+
+/**
+ * The caption snapshot the preview draws for one clip.
+ *
+ * Contract §3 has the server hand out `effective_caption` and §8.1 forbids the
+ * UI from reimplementing resolution, so a server snapshot is used verbatim.
+ * The base-preset fallback below only runs against a backend that predates the
+ * field: without it the editor would blank out rather than merely lag behind.
+ */
+export function captionForClip(
+  clip: Clip,
+  styles: CaptionStyle[],
+): EffectiveCaption | null {
+  if (clip.effective_caption) return clip.effective_caption
+  const base = styles.find((style) => style.key === clip.caption_style)?.preview
+  if (!base) return null
+  return { ...base, alignment: 'center' }
 }
 
 /** Format seconds as m:ss, or h:mm:ss past an hour. */
